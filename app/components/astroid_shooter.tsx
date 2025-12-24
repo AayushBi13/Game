@@ -56,6 +56,7 @@ interface PowerUp {
 interface ActivePowerUp {
   type: string;
   endTime: number;
+  startTime: number; // Track when power-up was activated for spin-up
 }
 
 export default function AsteroidShooter() {
@@ -89,6 +90,12 @@ export default function AsteroidShooter() {
   const nextParticleId = useRef(0);
   const nextPowerUpId = useRef(0);
   const gameLoopRef = useRef<number>(0);
+  const activePowerUpsRef = useRef<ActivePowerUp[]>([]);
+
+  // Keep ref in sync with state
+  useEffect(() => {
+    activePowerUpsRef.current = activePowerUps;
+  }, [activePowerUps]);
 
   // Initialize after mount to avoid SSR issues
   useEffect(() => {
@@ -244,7 +251,39 @@ export default function AsteroidShooter() {
     if (gameOver || !gameStarted) return;
 
     const now = Date.now();
-    const fireRate = hasPowerUp('rapidfire') ? 100 : 250;
+    const hasRapid = hasPowerUp('rapidfire');
+    const hasSpread = hasPowerUp('spread');
+    
+    // Calculate fire rate with spin-up
+    let fireRate = 250; // Default
+    
+    if (hasRapid) {
+      // Rapid fire: 100ms -> 10ms over 15 seconds
+      const rapidPowerUp = activePowerUps.find(p => p.type === 'rapidfire' && now < p.endTime);
+      if (rapidPowerUp) {
+        const elapsedTime = now - rapidPowerUp.startTime;
+        const spinUpDuration = 15000; // 15 seconds to reach max speed
+        const progress = Math.min(1, elapsedTime / spinUpDuration);
+        
+        // Interpolate from 100ms to 10ms
+        fireRate = 100 - (progress * 90); // 100 -> 10
+        
+        console.log('Rapid Fire - elapsed:', (elapsedTime/1000).toFixed(1), 's, progress:', (progress*100).toFixed(1), '%, fireRate:', fireRate.toFixed(1), 'ms');
+      }
+    } else if (hasSpread) {
+      // Spread shot: 250ms -> 150ms over 5 seconds
+      const spreadPowerUp = activePowerUps.find(p => p.type === 'spread' && now < p.endTime);
+      if (spreadPowerUp) {
+        const elapsedTime = now - spreadPowerUp.startTime;
+        const spinUpDuration = 5000; // 5 seconds to reach max speed
+        const progress = Math.min(1, elapsedTime / spinUpDuration);
+        
+        // Interpolate from 250ms to 150ms
+        fireRate = 250 - (progress * 100); // 250 -> 150
+        
+        console.log('Spread Shot - elapsed:', (elapsedTime/1000).toFixed(1), 's, progress:', (progress*100).toFixed(1), '%, fireRate:', fireRate.toFixed(1), 'ms');
+      }
+    }
     
     if (now - lastShotTime.current < fireRate) return;
     lastShotTime.current = now;
@@ -254,12 +293,11 @@ export default function AsteroidShooter() {
     const distance = Math.sqrt(dx * dx + dy * dy);
     const speed = 6;
 
-    const spreadActive = hasPowerUp('spread');
-    const bulletCount = spreadActive ? 3 : 1;
+    const bulletCount = hasSpread ? 3 : 1;
     const spreadAngle = 0.3;
 
     for (let i = 0; i < bulletCount; i++) {
-      const offset = spreadActive ? (i - 1) * spreadAngle : 0;
+      const offset = hasSpread ? (i - 1) * spreadAngle : 0;
       const angle = Math.atan2(dy, dx) + offset;
       
       const newBullet: Bullet = {
@@ -272,14 +310,19 @@ export default function AsteroidShooter() {
 
       setBullets(prev => [...prev, newBullet]);
     }
-  }, [gameOver, gameStarted, shipPos, hasPowerUp]);
+  }, [gameOver, gameStarted, shipPos, hasPowerUp, activePowerUps]);
 
   // Handle mouse down - start charging (disabled during rapidfire/spread)
   const handleMouseDown = useCallback((e: MouseEvent) => {
     if (gameOver || !gameStarted) return;
     
-    // Don't allow beam charging if rapidfire or spread is active
-    if (hasPowerUp('rapidfire') || hasPowerUp('spread')) {
+    // During rapidfire/spread, just shoot on click - don't charge
+    const hasRapid = hasPowerUp('rapidfire');
+    const hasSpread = hasPowerUp('spread');
+    
+    if (hasRapid || hasSpread) {
+      // Just shoot immediately, no charging
+      shootBullet(e.clientX, e.clientY);
       return;
     }
     
@@ -293,15 +336,14 @@ export default function AsteroidShooter() {
       targetY: e.clientY,
       damage: 0
     });
-  }, [gameOver, gameStarted, hasPowerUp]);
+  }, [gameOver, gameStarted, hasPowerUp, shootBullet]);
 
   // Handle mouse up - fire beam or bullet
   const handleMouseUp = useCallback((e: MouseEvent) => {
     if (gameOver || !gameStarted) return;
     
-    // If rapidfire or spread is active, just shoot bullets
+    // If rapidfire or spread is active, do nothing on mouse up (already shot on mouse down)
     if (hasPowerUp('rapidfire') || hasPowerUp('spread')) {
-      shootBullet(e.clientX, e.clientY);
       mouseDownTime.current = 0;
       return;
     }
@@ -353,61 +395,20 @@ export default function AsteroidShooter() {
       keysPressed.current.delete(e.key.toLowerCase());
     };
 
-    // Auto-fire when holding mouse during rapidfire/spread
-    let autoFireInterval: number | null = null;
-    let isMouseDown = false;
-    
-    const handleMouseDownForAutoFire = (e: MouseEvent) => {
-      isMouseDown = true;
-      currentMousePos.current = { x: e.clientX, y: e.clientY };
-      handleMouseDown(e);
-      
-      // Start auto-firing if rapidfire or spread is active
-      const checkAndFire = () => {
-        if (!isMouseDown) return;
-        
-        // Check power-ups inside the interval
-        const hasRapid = activePowerUps.some(p => p.type === 'rapidfire' && Date.now() < p.endTime);
-        const hasSpread = activePowerUps.some(p => p.type === 'spread' && Date.now() < p.endTime);
-        
-        if (hasRapid || hasSpread) {
-          shootBullet(currentMousePos.current.x, currentMousePos.current.y);
-        }
-      };
-      
-      if (activePowerUps.some(p => (p.type === 'rapidfire' || p.type === 'spread') && Date.now() < p.endTime)) {
-        const fireRate = activePowerUps.some(p => p.type === 'rapidfire' && Date.now() < p.endTime) ? 100 : 250;
-        autoFireInterval = window.setInterval(checkAndFire, fireRate) as unknown as number;
-      }
-    };
-    
-    const handleMouseUpForAutoFire = (e: MouseEvent) => {
-      isMouseDown = false;
-      handleMouseUp(e);
-      
-      if (autoFireInterval) {
-        clearInterval(autoFireInterval);
-        autoFireInterval = null;
-      }
-    };
-
     window.addEventListener('mousemove', handleMouseMove);
-    window.addEventListener('mousedown', handleMouseDownForAutoFire);
-    window.addEventListener('mouseup', handleMouseUpForAutoFire);
+    window.addEventListener('mousedown', handleMouseDown);
+    window.addEventListener('mouseup', handleMouseUp);
     window.addEventListener('keydown', handleKeyDown);
     window.addEventListener('keyup', handleKeyUp);
 
     return () => {
       window.removeEventListener('mousemove', handleMouseMove);
-      window.removeEventListener('mousedown', handleMouseDownForAutoFire);
-      window.removeEventListener('mouseup', handleMouseUpForAutoFire);
+      window.removeEventListener('mousedown', handleMouseDown);
+      window.removeEventListener('mouseup', handleMouseUp);
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
-      if (autoFireInterval) {
-        clearInterval(autoFireInterval);
-      }
     };
-  }, [handleMouseDown, handleMouseUp, isCharging, shootBullet, activePowerUps]);
+  }, [handleMouseDown, handleMouseUp, isCharging]);
 
   // Spawn asteroids periodically
   useEffect(() => {
@@ -483,7 +484,14 @@ export default function AsteroidShooter() {
           
           if (distance < 30) {
             // Collect power-up
-            const duration = 10000; // 10 seconds
+            let duration = 10000; // 10 seconds default
+            
+            // Different durations for different power-ups
+            if (powerUp.type === 'rapidfire') {
+              duration = 45000; // 45 seconds
+            } else if (powerUp.type === 'spread') {
+              duration = 30000; // 30 seconds
+            }
             
             if (powerUp.type === 'health') {
               setLives(l => Math.min(5, l + 1));
@@ -494,12 +502,12 @@ export default function AsteroidShooter() {
               if (powerUp.type === 'rapidfire' || powerUp.type === 'spread') {
                 setActivePowerUps(prev => [
                   ...prev.filter(p => p.type !== 'rapidfire' && p.type !== 'spread'),
-                  { type: powerUp.type, endTime: Date.now() + duration }
+                  { type: powerUp.type, endTime: Date.now() + duration, startTime: Date.now() }
                 ]);
               } else {
                 setActivePowerUps(prev => [
                   ...prev.filter(p => p.type !== powerUp.type),
-                  { type: powerUp.type, endTime: Date.now() + duration }
+                  { type: powerUp.type, endTime: Date.now() + duration, startTime: Date.now() }
                 ]);
               }
             }
@@ -892,9 +900,9 @@ export default function AsteroidShooter() {
                 <div style={{ color: '#00ffff' }}>Hold: Beam (2-10 dmg)</div>
               </>
             ) : hasPowerUp('rapidfire') ? (
-              <div style={{ color: '#ffff00' }}>RAPID FIRE: Hold to auto-shoot!</div>
+              <div style={{ color: '#ffff00' }}>RAPID FIRE: Click fast!</div>
             ) : (
-              <div style={{ color: '#ff00ff' }}>SPREAD SHOT: Hold to auto-shoot 3 bullets!</div>
+              <div style={{ color: '#ff00ff' }}>SPREAD SHOT: Shoots 3 bullets!</div>
             )}
             <div className="mt-2" style={{ color: '#ffaa00' }}>
               <div>Orange Line: Lead Target</div>
