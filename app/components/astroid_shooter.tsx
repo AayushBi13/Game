@@ -478,10 +478,18 @@ export default function AsteroidShooter() {
             } else if (powerUp.type === 'shield') {
               setShields(s => Math.min(5, s + 1));
             } else {
-              setActivePowerUps(prev => [
-                ...prev.filter(p => p.type !== powerUp.type),
-                { type: powerUp.type, endTime: Date.now() + duration }
-              ]);
+              // If picking up rapidfire or spread, remove the other one
+              if (powerUp.type === 'rapidfire' || powerUp.type === 'spread') {
+                setActivePowerUps(prev => [
+                  ...prev.filter(p => p.type !== 'rapidfire' && p.type !== 'spread'),
+                  { type: powerUp.type, endTime: Date.now() + duration }
+                ]);
+              } else {
+                setActivePowerUps(prev => [
+                  ...prev.filter(p => p.type !== powerUp.type),
+                  { type: powerUp.type, endTime: Date.now() + duration }
+                ]);
+              }
             }
             
             spawnParticles(powerUp.x, powerUp.y, 12, getPowerUpColor(powerUp.type));
