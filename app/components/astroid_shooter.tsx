@@ -82,6 +82,7 @@ export default function AsteroidShooter() {
   const beamInterval = useRef<number>(0);
   const lastCollisionTime = useRef<number>(0);
   const lastShotTime = useRef<number>(0);
+  const currentMousePos = useRef({ x: 0, y: 0 });
   
   const nextAsteroidId = useRef(0);
   const nextBulletId = useRef(0);
@@ -332,6 +333,7 @@ export default function AsteroidShooter() {
   // Track mouse position and keyboard
   useEffect(() => {
     const handleMouseMove = (e: MouseEvent) => {
+      currentMousePos.current = { x: e.clientX, y: e.clientY };
       setMousePos({ x: e.clientX, y: e.clientY });
       
       if (isCharging) {
@@ -357,15 +359,25 @@ export default function AsteroidShooter() {
     
     const handleMouseDownForAutoFire = (e: MouseEvent) => {
       isMouseDown = true;
+      currentMousePos.current = { x: e.clientX, y: e.clientY };
       handleMouseDown(e);
       
       // Start auto-firing if rapidfire or spread is active
-      if (hasPowerUp('rapidfire') || hasPowerUp('spread')) {
-        autoFireInterval = window.setInterval(() => {
-          if (isMouseDown) {
-            shootBullet(e.clientX, e.clientY);
-          }
-        }, hasPowerUp('rapidfire') ? 100 : 250) as unknown as number;
+      const checkAndFire = () => {
+        if (!isMouseDown) return;
+        
+        // Check power-ups inside the interval
+        const hasRapid = activePowerUps.some(p => p.type === 'rapidfire' && Date.now() < p.endTime);
+        const hasSpread = activePowerUps.some(p => p.type === 'spread' && Date.now() < p.endTime);
+        
+        if (hasRapid || hasSpread) {
+          shootBullet(currentMousePos.current.x, currentMousePos.current.y);
+        }
+      };
+      
+      if (activePowerUps.some(p => (p.type === 'rapidfire' || p.type === 'spread') && Date.now() < p.endTime)) {
+        const fireRate = activePowerUps.some(p => p.type === 'rapidfire' && Date.now() < p.endTime) ? 100 : 250;
+        autoFireInterval = window.setInterval(checkAndFire, fireRate) as unknown as number;
       }
     };
     
@@ -395,7 +407,7 @@ export default function AsteroidShooter() {
         clearInterval(autoFireInterval);
       }
     };
-  }, [handleMouseDown, handleMouseUp, isCharging, hasPowerUp, shootBullet]);
+  }, [handleMouseDown, handleMouseUp, isCharging, shootBullet, activePowerUps]);
 
   // Spawn asteroids periodically
   useEffect(() => {
