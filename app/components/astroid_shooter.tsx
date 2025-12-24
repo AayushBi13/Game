@@ -2,7 +2,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import Crosshair from '@/app/components/crosshair';
 import TargetCursor from '@/components/TargetCursor';
-import AntiGravity from '@/app/components/anti_gravity';
+import PixelSnow from '@/app/components/snow';
 
 interface Asteroid {
   id: number;
@@ -617,7 +617,7 @@ export default function AsteroidShooter() {
           50% { opacity: 1; }
         }
       `}</style>
-      {/* Background layer */}
+      {/* Background layer - Changed to PixelSnow */}
       <div style={{
         position: 'absolute',
         top: 0,
@@ -626,7 +626,20 @@ export default function AsteroidShooter() {
         height: '100%',
         zIndex: 0
       }}>
-        <AntiGravity />
+        <PixelSnow 
+          color="#ffffff"
+          flakeSize={0.01}
+          minFlakeSize={1.25}
+          pixelResolution={200}
+          speed={1.25}
+          depthFade={8}
+          farPlane={20}
+          brightness={0.7}
+          gamma={0.4545}
+          density={0.3}
+          variant="snowflake"
+          direction={125}
+        />
       </div>
 
       {/* Game UI */}
