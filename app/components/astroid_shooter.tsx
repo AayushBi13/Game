@@ -60,6 +60,16 @@ interface ActivePowerUp {
   startTime: number; // Track when power-up was activated for spin-up
 }
 
+interface Missile {
+  id: number;
+  x: number;
+  y: number;
+  velocityX: number;
+  velocityY: number;
+  targetId: number;
+  spawnTime: number; // Track when missile was spawned for acceleration
+}
+
 export default function AsteroidShooter() {
   const [score, setScore] = useState(0);
   const [lives, setLives] = useState(3);
@@ -68,6 +78,7 @@ export default function AsteroidShooter() {
   const [gameStarted, setGameStarted] = useState(false);
   const [asteroids, setAsteroids] = useState<Asteroid[]>([]);
   const [bullets, setBullets] = useState<Bullet[]>([]);
+  const [missiles, setMissiles] = useState<Missile[]>([]);
   const [particles, setParticles] = useState<Particle[]>([]);
   const [powerUps, setPowerUps] = useState<PowerUp[]>([]);
   const [activePowerUps, setActivePowerUps] = useState<ActivePowerUp[]>([]);
@@ -80,6 +91,17 @@ export default function AsteroidShooter() {
   const [isCharging, setIsCharging] = useState(false);
   const [invincible, setInvincible] = useState(false);
   const [showCheatMenu, setShowCheatMenu] = useState(false);
+  
+  // Abilities
+  const [timeSlowActive, setTimeSlowActive] = useState(false);
+  const [timeSlowEndTime, setTimeSlowEndTime] = useState(0);
+  const [timeSlowCooldown, setTimeSlowCooldown] = useState(0);
+  
+  const [missileBarrageCooldown, setMissileBarrageCooldown] = useState(0);
+  
+  const [magnetActive, setMagnetActive] = useState(false);
+  const [magnetEndTime, setMagnetEndTime] = useState(0);
+  
   const keysPressed = useRef<Set<string>>(new Set());
   const mouseDownTime = useRef<number>(0);
   const beamInterval = useRef<number>(0);
@@ -90,6 +112,7 @@ export default function AsteroidShooter() {
   
   const nextAsteroidId = useRef(0);
   const nextBulletId = useRef(0);
+  const nextMissileId = useRef(0);
   const nextParticleId = useRef(0);
   const nextPowerUpId = useRef(0);
   const nextBeamId = useRef(0);
@@ -100,6 +123,53 @@ export default function AsteroidShooter() {
   useEffect(() => {
     activePowerUpsRef.current = activePowerUps;
   }, [activePowerUps]);
+
+  // Ability: Time Slow (E key) - Defensive
+  const activateTimeSlow = useCallback(() => {
+    if (!gameStarted || gameOver) return;
+    const now = Date.now();
+    
+    if (now < timeSlowCooldown) return; // On cooldown
+    
+    setTimeSlowActive(true);
+    setTimeSlowEndTime(now + 3500); // 3.5 seconds duration
+    setTimeSlowCooldown(now + 10000); // 10 second cooldown
+    
+    setTimeout(() => {
+      setTimeSlowActive(false);
+    }, 3500);
+  }, [gameStarted, gameOver, timeSlowCooldown]);
+
+  // Ability: Missile Barrage (Q key) - Offensive
+  const activateMissileBarrage = useCallback(() => {
+    if (!gameStarted || gameOver) return;
+    const now = Date.now();
+    
+    if (now < missileBarrageCooldown) return; // On cooldown
+    
+    setMissileBarrageCooldown(now + 5000); // 5 second cooldown
+    
+    // Fire up to 3 missiles at random asteroids
+    const targets = [...asteroids].sort(() => Math.random() - 0.5).slice(0, Math.min(3, asteroids.length));
+    
+    targets.forEach((target, index) => {
+      setTimeout(() => {
+        const missile: Missile = {
+          id: nextMissileId.current++,
+          x: shipPos.x,
+          y: shipPos.y,
+          velocityX: 0,
+          velocityY: 0,
+          targetId: target.id,
+          spawnTime: Date.now()
+        };
+        setMissiles(prev => [...prev, missile]);
+      }, index * 100); // Stagger launches by 100ms
+    });
+  }, [gameStarted, gameOver, missileBarrageCooldown, asteroids, shipPos]);
+
+  // Ability: Magnet (Utility pickup) - Already handled in power-up system
+  // This will be a power-up drop like shield/health
 
   // Initialize after mount to avoid SSR issues
   useEffect(() => {
@@ -386,9 +456,9 @@ export default function AsteroidShooter() {
       }
       // Spread shot modifies beam to be wider and more powerful
       else if (hasSpread) {
-        chargeTime = 4.0; // 4 seconds to max charge
+        chargeTime = 3.0; // 3 seconds to max charge
         const baseDamage = 11;
-        // Use min to cap at 4 seconds, so damage caps at 44
+        // Use min to cap at 3 seconds, so damage caps at 44
         const chargeProgress = Math.min(1, holdDuration / chargeTime);
         const chargeMultiplier = 1 + (chargeProgress * 3); // 1x to 4x
         damage = baseDamage * chargeMultiplier; // 11 to 44 damage
@@ -433,6 +503,14 @@ export default function AsteroidShooter() {
 
     const handleKeyDown = (e: KeyboardEvent) => {
       keysPressed.current.add(e.key.toLowerCase());
+      
+      // Ability hotkeys
+      if (e.key.toLowerCase() === 'e') {
+        activateTimeSlow();
+      }
+      if (e.key.toLowerCase() === 'q') {
+        activateMissileBarrage();
+      }
     };
 
     const handleKeyUp = (e: KeyboardEvent) => {
@@ -452,7 +530,7 @@ export default function AsteroidShooter() {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
     };
-  }, [handleMouseDown, handleMouseUp, isCharging]);
+  }, [handleMouseDown, handleMouseUp, isCharging, activateTimeSlow, activateMissileBarrage]);
 
   // Spawn asteroids periodically
   useEffect(() => {
@@ -570,10 +648,13 @@ export default function AsteroidShooter() {
 
       // Update asteroids
       setAsteroids(prev => {
+        // Time slow modifier
+        const timeSlowMod = timeSlowActive ? 0.3 : 1.0; // 30% speed when slow is active
+        
         const updated = prev.map(asteroid => ({
           ...asteroid,
-          x: asteroid.x + asteroid.speedX,
-          y: asteroid.y + asteroid.speedY,
+          x: asteroid.x + (asteroid.speedX * timeSlowMod),
+          y: asteroid.y + (asteroid.speedY * timeSlowMod),
           rotation: asteroid.rotation + asteroid.rotationSpeed
         })).filter(asteroid => {
           return asteroid.x > -100 && asteroid.x < window.innerWidth + 100 &&
@@ -639,6 +720,71 @@ export default function AsteroidShooter() {
           bullet.y > 0 && bullet.y < window.innerHeight
         )
       );
+
+      // Update missiles with homing behavior and acceleration
+      setMissiles(prev => {
+        const asteroidList = asteroids;
+        const now = Date.now();
+        
+        return prev.map(missile => {
+          // Calculate acceleration progress (0 to 1 over 1 second)
+          const timeAlive = (now - missile.spawnTime) / 1000; // seconds
+          const accelerationDuration = 1.0; // 1 second to reach max speed
+          const accelerationProgress = Math.min(1, timeAlive / accelerationDuration);
+          
+          // Find target asteroid
+          const target = asteroidList.find(a => a.id === missile.targetId);
+          
+          if (target) {
+            // Homing logic - slower for better visual tracking
+            const dx = target.x - missile.x;
+            const dy = target.y - missile.y;
+            const distance = Math.sqrt(dx * dx + dy * dy);
+            
+            const maxSpeed = 3.4; // Maximum speed
+            const currentSpeed = maxSpeed * accelerationProgress; // Accelerate from 0 to 3.4
+            const turnRate = 0.15; // Gradual turning
+            
+            // Calculate target angle
+            const targetAngle = Math.atan2(dy, dx);
+            
+            // Calculate current angle
+            const currentAngle = Math.atan2(missile.velocityY, missile.velocityX);
+            
+            // Smoothly interpolate angle (only if missile is moving)
+            let newAngle = targetAngle;
+            if (accelerationProgress > 0.1) {
+              let angleDiff = targetAngle - currentAngle;
+              // Normalize angle difference to -PI to PI
+              while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
+              while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
+              
+              newAngle = currentAngle + angleDiff * turnRate;
+            }
+            
+            const newVelX = Math.cos(newAngle) * currentSpeed;
+            const newVelY = Math.sin(newAngle) * currentSpeed;
+            
+            return {
+              ...missile,
+              x: missile.x + newVelX,
+              y: missile.y + newVelY,
+              velocityX: newVelX,
+              velocityY: newVelY
+            };
+          }
+          
+          // Target destroyed, keep moving straight with current velocity
+          return {
+            ...missile,
+            x: missile.x + missile.velocityX,
+            y: missile.y + missile.velocityY
+          };
+        }).filter(missile => 
+          missile.x > -50 && missile.x < window.innerWidth + 50 &&
+          missile.y > -50 && missile.y < window.innerHeight + 50
+        );
+      });
 
       // Update particles
       setParticles(prev => 
@@ -710,6 +856,65 @@ export default function AsteroidShooter() {
         return remainingBullets;
       });
 
+      // Check missile-asteroid collisions
+      setMissiles(prevMissiles => {
+        const remainingMissiles = [...prevMissiles];
+        
+        setAsteroids(prevAsteroids => {
+          let updatedAsteroids = [...prevAsteroids];
+          
+          for (let i = remainingMissiles.length - 1; i >= 0; i--) {
+            const missile = remainingMissiles[i];
+            
+            for (let j = updatedAsteroids.length - 1; j >= 0; j--) {
+              const asteroid = updatedAsteroids[j];
+              const dx = missile.x - asteroid.x;
+              const dy = missile.y - asteroid.y;
+              const distance = Math.sqrt(dx * dx + dy * dy);
+              
+              if (distance < asteroid.size + 5) {
+                // Missile hit - deal 10 damage
+                asteroid.hp -= 10;
+                
+                if (asteroid.hp <= 0) {
+                  const particleColor = getAsteroidColor(asteroid.type);
+                  spawnParticles(asteroid.x, asteroid.y, 15, particleColor);
+                  setScore(s => s + Math.floor(asteroid.size * (asteroid.type === 'armored' ? 2 : 1)));
+                  
+                  // Clear locked target if this asteroid was locked
+                  if (lockedTargetRef.current && lockedTargetRef.current.id === asteroid.id) {
+                    lockedTargetRef.current = null;
+                    setLockedTarget(null);
+                  }
+                  
+                  if (Math.random() < 0.2) {
+                    spawnPowerUp(asteroid.x, asteroid.y);
+                  }
+                  
+                  if (asteroid.type === 'splitting') {
+                    spawnSplitAsteroids(asteroid.x, asteroid.y);
+                  }
+                  
+                  updatedAsteroids.splice(j, 1);
+                } else {
+                  spawnParticles(asteroid.x, asteroid.y, 5);
+                }
+                
+                // Create explosion particles
+                spawnParticles(missile.x, missile.y, 10, '#ffaa00');
+                
+                remainingMissiles.splice(i, 1);
+                break;
+              }
+            }
+          }
+          
+          return updatedAsteroids;
+        });
+        
+        return remainingMissiles;
+      });
+
       // Check beam-asteroid collisions for all active beams
       beams.forEach(beam => {
         setAsteroids(prevAsteroids => {
@@ -739,12 +944,12 @@ export default function AsteroidShooter() {
               
               // Beam width scales with damage
               // Normal: 10px fixed
-              // Spread: 10px to 45px based on damage (11 to 44)
+              // Spread: 10px to 65px based on damage (11 to 44)
               let beamWidth = 10;
               if (hasPowerUp('spread')) {
-                // Scale from 10px (at 11 damage) to 45px (at 44 damage)
+                // Scale from 10px (at 11 damage) to 65px (at 44 damage)
                 const damageRatio = (beam.damage - 11) / (44 - 11); // 0 to 1
-                beamWidth = 10 + (damageRatio * 35); // 10 to 45
+                beamWidth = 10 + (damageRatio * 55); // 10 to 65
               }
               
               if (distToBeam < asteroid.size + beamWidth) {
@@ -790,6 +995,21 @@ export default function AsteroidShooter() {
       let closestAsteroid: Asteroid | null = null;
       let closestDistance = Infinity;
 
+      // If we have a locked target, verify it still exists and update its reference
+      if (lockedTargetRef.current) {
+        const currentTarget = asteroidList.find(a => a.id === lockedTargetRef.current?.id);
+        if (currentTarget) {
+          // Update the locked target with current asteroid data
+          lockedTargetRef.current = currentTarget;
+          setLockedTarget(currentTarget);
+        } else {
+          // Target no longer exists, clear it
+          lockedTargetRef.current = null;
+          setLockedTarget(null);
+        }
+      }
+
+      // Find closest asteroid to cursor
       asteroidList.forEach(asteroid => {
         const dx = asteroid.x - cursorX;
         const dy = asteroid.y - cursorY;
@@ -801,8 +1021,14 @@ export default function AsteroidShooter() {
         }
       });
 
-      lockedTargetRef.current = closestAsteroid;
-      setLockedTarget(closestAsteroid);
+      // Only update lock if we found a new close asteroid
+      if (closestAsteroid) {
+        lockedTargetRef.current = closestAsteroid;
+        setLockedTarget(closestAsteroid);
+      } else if (!lockedTargetRef.current) {
+        // No close asteroid and no current lock
+        setLockedTarget(null);
+      }
     };
 
     gameLoopRef.current = requestAnimationFrame(gameLoop);
@@ -822,6 +1048,7 @@ export default function AsteroidShooter() {
     setShields(0);
     setAsteroids([]);
     setBullets([]);
+    setMissiles([]);
     setParticles([]);
     setPowerUps([]);
     setActivePowerUps([]);
@@ -832,12 +1059,19 @@ export default function AsteroidShooter() {
     setBeams([]);
     setIsCharging(false);
     setInvincible(false);
+    setTimeSlowActive(false);
+    setTimeSlowEndTime(0);
+    setTimeSlowCooldown(0);
+    setMissileBarrageCooldown(0);
+    setMagnetActive(false);
+    setMagnetEndTime(0);
     keysPressed.current.clear();
     mouseDownTime.current = 0;
     lastCollisionTime.current = 0;
     lastShotTime.current = 0;
     nextAsteroidId.current = 0;
     nextBulletId.current = 0;
+    nextMissileId.current = 0;
     nextParticleId.current = 0;
     nextPowerUpId.current = 0;
     nextBeamId.current = 0;
@@ -851,6 +1085,7 @@ export default function AsteroidShooter() {
     setGameOver(false);
     setAsteroids([]);
     setBullets([]);
+    setMissiles([]);
     setParticles([]);
     setPowerUps([]);
     setActivePowerUps([]);
@@ -861,12 +1096,19 @@ export default function AsteroidShooter() {
     setBeams([]);
     setIsCharging(false);
     setInvincible(false);
+    setTimeSlowActive(false);
+    setTimeSlowEndTime(0);
+    setTimeSlowCooldown(0);
+    setMissileBarrageCooldown(0);
+    setMagnetActive(false);
+    setMagnetEndTime(0);
     keysPressed.current.clear();
     mouseDownTime.current = 0;
     lastCollisionTime.current = 0;
     lastShotTime.current = 0;
     nextAsteroidId.current = 0;
     nextBulletId.current = 0;
+    nextMissileId.current = 0;
     nextParticleId.current = 0;
     nextPowerUpId.current = 0;
     nextBeamId.current = 0;
@@ -965,6 +1207,50 @@ export default function AsteroidShooter() {
         />
       </div>
 
+      {/* Time Slow Effect */}
+      {timeSlowActive && (
+        <>
+          {/* Grayscale filter overlay */}
+          <div 
+            className="absolute top-0 left-0 w-full h-full z-50 pointer-events-none"
+            style={{
+              mixBlendMode: 'saturation',
+              backgroundColor: 'rgba(128, 128, 128, 0.8)',
+              animation: 'flash 0.5s ease-in-out'
+            }}
+          />
+          
+          {/* Subtle radial effect */}
+          <svg className="absolute top-0 left-0 w-full h-full z-50 pointer-events-none" style={{ opacity: 0.3 }}>
+            {/* Radial lines emanating from center */}
+            {Array.from({ length: 12 }).map((_, i) => {
+              const angle = (i * 30) * (Math.PI / 180);
+              const length = Math.max(window.innerWidth, window.innerHeight);
+              const centerX = window.innerWidth / 2;
+              const centerY = window.innerHeight / 2;
+              const endX = centerX + Math.cos(angle) * length;
+              const endY = centerY + Math.sin(angle) * length;
+              
+              return (
+                <line
+                  key={i}
+                  x1={centerX}
+                  y1={centerY}
+                  x2={endX}
+                  y2={endY}
+                  stroke="rgba(200, 200, 200, 0.3)"
+                  strokeWidth="1"
+                  style={{
+                    animation: 'flash 0.3s ease-out',
+                    filter: 'blur(2px)'
+                  }}
+                />
+              );
+            })}
+          </svg>
+        </>
+      )}
+
       {/* Game UI */}
       {gameStarted && !gameOver && (
         <>
@@ -989,6 +1275,31 @@ export default function AsteroidShooter() {
                 </div>
               );
             })}
+          </div>
+
+          {/* Ability Cooldowns */}
+          <div className="absolute top-5 right-5 z-10 text-white font-mono text-sm mt-32" style={{ textShadow: '2px 2px 4px rgba(0,0,0,0.8)' }}>
+            <div className="mb-2">
+              <div className="flex items-center gap-2">
+                <span style={{ color: '#00ffff' }}>E - Time Slow:</span>
+                {Date.now() < timeSlowCooldown ? (
+                  <span style={{ color: '#ff6666' }}>{Math.ceil((timeSlowCooldown - Date.now()) / 1000)}s</span>
+                ) : (
+                  <span style={{ color: '#00ff00' }}>READY</span>
+                )}
+              </div>
+              {timeSlowActive && <span style={{ color: '#ffff00' }}>ACTIVE!</span>}
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <span style={{ color: '#ff8800' }}>Q - Missiles:</span>
+                {Date.now() < missileBarrageCooldown ? (
+                  <span style={{ color: '#ff6666' }}>{Math.ceil((missileBarrageCooldown - Date.now()) / 1000)}s</span>
+                ) : (
+                  <span style={{ color: '#00ff00' }}>READY</span>
+                )}
+              </div>
+            </div>
           </div>
 
           {/* Controls */}
@@ -1291,6 +1602,28 @@ export default function AsteroidShooter() {
             />
           ))}
 
+          {/* Missiles */}
+          {missiles.map(missile => (
+            <div
+              key={missile.id}
+              className="absolute"
+              style={{
+                left: missile.x,
+                top: missile.y,
+                transform: 'translate(-50%, -50%)'
+              }}
+            >
+              <div className="w-2 h-3 bg-gradient-to-b from-orange-500 to-red-600 rounded-full"
+                   style={{
+                     boxShadow: '0 0 8px rgba(255, 100, 0, 0.8)',
+                     filter: 'brightness(1.2)'
+                   }}>
+                <div className="w-0.5 h-0.5 rounded-full bg-yellow-300 absolute top-0.5 left-0.5"
+                     style={{ boxShadow: '0 0 3px yellow' }} />
+              </div>
+            </div>
+          ))}
+
           {/* Particles */}
           {particles.map(particle => (
             <div
@@ -1319,8 +1652,8 @@ export default function AsteroidShooter() {
                 if (hasPowerUp('spread')) {
                   // Scale from narrow (at 11 dmg) to wide (at 44 dmg)
                   const damageRatio = Math.min(1, (beam.damage - 11) / (44 - 11));
-                  outerWidth = 10 + (damageRatio * 40); // 10 to 50
-                  innerWidth = 5 + (damageRatio * 20); // 5 to 25
+                  outerWidth = 10 + (damageRatio * 55); // 10 to 65
+                  innerWidth = 5 + (damageRatio * 27.5); // 5 to 32.5
                 } else if (hasPowerUp('rapidfire')) {
                   outerWidth = Math.min(20, 5 + beam.damage * 1.5);
                   innerWidth = Math.min(10, 2 + beam.damage * 0.8);
@@ -1411,7 +1744,7 @@ export default function AsteroidShooter() {
                    }}>
                 <div className="h-full transition-all duration-50"
                      style={{
-                       width: `${Math.min(100, ((Date.now() - mouseDownTime.current) / (hasPowerUp('rapidfire') ? 500 : hasPowerUp('spread') ? 4000 : 1000)) * 100)}%`,
+                       width: `${Math.min(100, ((Date.now() - mouseDownTime.current) / (hasPowerUp('rapidfire') ? 500 : hasPowerUp('spread') ? 3000 : 1000)) * 100)}%`,
                        backgroundColor: hasPowerUp('rapidfire') ? '#ffff00' : hasPowerUp('spread') ? '#ff00ff' : 'cyan',
                        boxShadow: `0 0 10px ${hasPowerUp('rapidfire') ? '#ffff00' : hasPowerUp('spread') ? '#ff00ff' : 'cyan'}`
                      }} />
