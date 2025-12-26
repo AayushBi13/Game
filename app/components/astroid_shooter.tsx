@@ -38,6 +38,7 @@ interface Particle {
 }
 
 interface BeamWeapon {
+  id: number;
   active: boolean;
   startTime: number;
   targetX: number;
@@ -75,20 +76,23 @@ export default function AsteroidShooter() {
   const [shipVelocity, setShipVelocity] = useState({ x: 0, y: 0 });
   const [lockedTarget, setLockedTarget] = useState<Asteroid | null>(null);
   const [mounted, setMounted] = useState(false);
-  const [beam, setBeam] = useState<BeamWeapon>({ active: false, startTime: 0, targetX: 0, targetY: 0, damage: 0 });
+  const [beams, setBeams] = useState<BeamWeapon[]>([]);
   const [isCharging, setIsCharging] = useState(false);
   const [invincible, setInvincible] = useState(false);
+  const [showCheatMenu, setShowCheatMenu] = useState(false);
   const keysPressed = useRef<Set<string>>(new Set());
   const mouseDownTime = useRef<number>(0);
   const beamInterval = useRef<number>(0);
   const lastCollisionTime = useRef<number>(0);
   const lastShotTime = useRef<number>(0);
   const currentMousePos = useRef({ x: 0, y: 0 });
+  const lockedTargetRef = useRef<Asteroid | null>(null);
   
   const nextAsteroidId = useRef(0);
   const nextBulletId = useRef(0);
   const nextParticleId = useRef(0);
   const nextPowerUpId = useRef(0);
+  const nextBeamId = useRef(0);
   const gameLoopRef = useRef<number>(0);
   const activePowerUpsRef = useRef<ActivePowerUp[]>([]);
 
@@ -285,7 +289,13 @@ export default function AsteroidShooter() {
       }
     }
     
-    if (now - lastShotTime.current < fireRate) return;
+    // Check if enough time has passed since last shot
+    const timeSinceLastShot = now - lastShotTime.current;
+    if (timeSinceLastShot < fireRate) {
+      console.log('Rate limited - need', fireRate.toFixed(1), 'ms, only', timeSinceLastShot.toFixed(1), 'ms passed');
+      return;
+    }
+    
     lastShotTime.current = now;
 
     const dx = mouseX - shipPos.x;
@@ -310,63 +320,105 @@ export default function AsteroidShooter() {
 
       setBullets(prev => [...prev, newBullet]);
     }
+    
+    console.log('FIRED! Next shot in', fireRate.toFixed(1), 'ms');
   }, [gameOver, gameStarted, shipPos, hasPowerUp, activePowerUps]);
 
-  // Handle mouse down - start charging (disabled during rapidfire/spread)
+  // Handle mouse down - start charging
   const handleMouseDown = useCallback((e: MouseEvent) => {
     if (gameOver || !gameStarted) return;
     
-    // During rapidfire/spread, just shoot on click - don't charge
-    const hasRapid = hasPowerUp('rapidfire');
-    const hasSpread = hasPowerUp('spread');
-    
-    if (hasRapid || hasSpread) {
-      // Just shoot immediately, no charging
-      shootBullet(e.clientX, e.clientY);
-      return;
-    }
-    
     mouseDownTime.current = Date.now();
     setIsCharging(true);
-    
-    setBeam({
-      active: false,
-      startTime: Date.now(),
-      targetX: e.clientX,
-      targetY: e.clientY,
-      damage: 0
-    });
-  }, [gameOver, gameStarted, hasPowerUp, shootBullet]);
+  }, [gameOver, gameStarted]);
 
-  // Handle mouse up - fire beam or bullet
+  // Handle mouse up - fire beam or bullet (modified by power-ups)
   const handleMouseUp = useCallback((e: MouseEvent) => {
     if (gameOver || !gameStarted) return;
-    
-    // If rapidfire or spread is active, do nothing on mouse up (already shot on mouse down)
-    if (hasPowerUp('rapidfire') || hasPowerUp('spread')) {
-      mouseDownTime.current = 0;
-      return;
-    }
     
     const holdDuration = (Date.now() - mouseDownTime.current) / 1000;
     setIsCharging(false);
     
+    const hasRapid = hasPowerUp('rapidfire');
+    const hasSpread = hasPowerUp('spread');
+    
     if (holdDuration < 0.1) {
+      // Quick tap - shoot bullet
       shootBullet(e.clientX, e.clientY);
     } else {
-      const damage = Math.min(10, 2 + (holdDuration * 10));
+      // Held - fire beam (modified by power-ups)
+      let damage: number;
+      let maxDamage: number;
+      let chargeTime: number;
+      let beamColor: string = 'cyan';
       
-      setBeam({
+      // Rapid fire modifies beam to fire 3 consecutive beams
+      if (hasRapid) {
+        maxDamage = 8;
+        chargeTime = 0.5; // 0.5 seconds to max charge
+        damage = Math.min(maxDamage, 2 + (holdDuration * (maxDamage - 2) / chargeTime));
+        beamColor = '#ffff00'; // Yellow
+        
+        // Fire 3 beams in quick succession
+        for (let i = 0; i < 3; i++) {
+          setTimeout(() => {
+            const beamId = nextBeamId.current++;
+            const newBeam: BeamWeapon = {
+              id: beamId,
+              active: true,
+              startTime: Date.now(),
+              targetX: e.clientX,
+              targetY: e.clientY,
+              damage: damage
+            };
+            
+            setBeams(prev => [...prev, newBeam]);
+            
+            // Remove beam after 120ms (so beams are distinct with 150ms spacing)
+            setTimeout(() => {
+              setBeams(prev => prev.filter(b => b.id !== beamId));
+            }, 120);
+          }, i * 150); // 150ms apart
+        }
+        
+        mouseDownTime.current = 0;
+        return;
+      }
+      // Spread shot modifies beam to be wider and more powerful
+      else if (hasSpread) {
+        chargeTime = 4.0; // 4 seconds to max charge
+        const baseDamage = 11;
+        // Use min to cap at 4 seconds, so damage caps at 44
+        const chargeProgress = Math.min(1, holdDuration / chargeTime);
+        const chargeMultiplier = 1 + (chargeProgress * 3); // 1x to 4x
+        damage = baseDamage * chargeMultiplier; // 11 to 44 damage
+        beamColor = '#ff00ff'; // Purple
+        
+        console.log('Spread Shot Beam - holdDuration:', holdDuration.toFixed(2), 's, chargeProgress:', (chargeProgress * 100).toFixed(1), '%, damage:', damage.toFixed(1));
+      }
+      // Normal beam
+      else {
+        maxDamage = 10;
+        chargeTime = 1.0;
+        damage = Math.min(maxDamage, 2 + (holdDuration * (maxDamage - 2) / chargeTime));
+      }
+      
+      const beamId = nextBeamId.current++;
+      const newBeam: BeamWeapon = {
+        id: beamId,
         active: true,
         startTime: Date.now(),
         targetX: e.clientX,
         targetY: e.clientY,
         damage: damage
-      });
+      };
       
+      setBeams(prev => [...prev, newBeam]);
+      
+      // Beam persists for 500ms (about 30 frames at 60fps)
       setTimeout(() => {
-        setBeam(prev => ({ ...prev, active: false }));
-      }, 200);
+        setBeams(prev => prev.filter(b => b.id !== beamId));
+      }, 500);
     }
     
     mouseDownTime.current = 0;
@@ -377,14 +429,6 @@ export default function AsteroidShooter() {
     const handleMouseMove = (e: MouseEvent) => {
       currentMousePos.current = { x: e.clientX, y: e.clientY };
       setMousePos({ x: e.clientX, y: e.clientY });
-      
-      if (isCharging) {
-        setBeam(prev => ({
-          ...prev,
-          targetX: e.clientX,
-          targetY: e.clientY
-        }));
-      }
     };
 
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -488,7 +532,7 @@ export default function AsteroidShooter() {
             
             // Different durations for different power-ups
             if (powerUp.type === 'rapidfire') {
-              duration = 45000; // 45 seconds
+              duration = 30000; // 30 seconds
             } else if (powerUp.type === 'spread') {
               duration = 30000; // 30 seconds
             }
@@ -633,6 +677,12 @@ export default function AsteroidShooter() {
                   spawnParticles(asteroid.x, asteroid.y, 12, particleColor);
                   setScore(s => s + Math.floor(asteroid.size * (asteroid.type === 'armored' ? 2 : 1)));
                   
+                  // Clear locked target if this asteroid was locked
+                  if (lockedTargetRef.current && lockedTargetRef.current.id === asteroid.id) {
+                    lockedTargetRef.current = null;
+                    setLockedTarget(null);
+                  }
+                  
                   // 20% chance to drop power-up
                   if (Math.random() < 0.2) {
                     spawnPowerUp(asteroid.x, asteroid.y);
@@ -660,8 +710,8 @@ export default function AsteroidShooter() {
         return remainingBullets;
       });
 
-      // Check beam-asteroid collisions
-      if (beam.active) {
+      // Check beam-asteroid collisions for all active beams
+      beams.forEach(beam => {
         setAsteroids(prevAsteroids => {
           let updatedAsteroids = [...prevAsteroids];
           
@@ -687,13 +737,29 @@ export default function AsteroidShooter() {
               const distTy = asteroid.y - closestY;
               const distToBeam = Math.sqrt(distTx * distTx + distTy * distTy);
               
-              if (distToBeam < asteroid.size + 10) {
+              // Beam width scales with damage
+              // Normal: 10px fixed
+              // Spread: 10px to 45px based on damage (11 to 44)
+              let beamWidth = 10;
+              if (hasPowerUp('spread')) {
+                // Scale from 10px (at 11 damage) to 45px (at 44 damage)
+                const damageRatio = (beam.damage - 11) / (44 - 11); // 0 to 1
+                beamWidth = 10 + (damageRatio * 35); // 10 to 45
+              }
+              
+              if (distToBeam < asteroid.size + beamWidth) {
                 asteroid.hp -= beam.damage;
                 
                 if (asteroid.hp <= 0) {
                   const particleColor = getAsteroidColor(asteroid.type);
                   spawnParticles(asteroid.x, asteroid.y, 12, particleColor);
                   setScore(s => s + Math.floor(asteroid.size * 2 * (asteroid.type === 'armored' ? 2 : 1)));
+                  
+                  // Clear locked target if this asteroid was locked
+                  if (lockedTargetRef.current && lockedTargetRef.current.id === asteroid.id) {
+                    lockedTargetRef.current = null;
+                    setLockedTarget(null);
+                  }
                   
                   if (Math.random() < 0.2) {
                     spawnPowerUp(asteroid.x, asteroid.y);
@@ -713,7 +779,7 @@ export default function AsteroidShooter() {
           
           return updatedAsteroids;
         });
-      }
+      });
 
       gameLoopRef.current = requestAnimationFrame(gameLoop);
     };
@@ -735,6 +801,7 @@ export default function AsteroidShooter() {
         }
       });
 
+      lockedTargetRef.current = closestAsteroid;
       setLockedTarget(closestAsteroid);
     };
 
@@ -745,7 +812,7 @@ export default function AsteroidShooter() {
         cancelAnimationFrame(gameLoopRef.current);
       }
     };
-  }, [gameOver, gameStarted, shipPos, shipVelocity, mousePos, beam, invincible, hasPowerUp, spawnParticles, spawnPowerUp, spawnSplitAsteroids]);
+  }, [gameOver, gameStarted, shipPos, shipVelocity, mousePos, beams, invincible, hasPowerUp, spawnParticles, spawnPowerUp, spawnSplitAsteroids]);
 
   const startGame = () => {
     setGameStarted(true);
@@ -761,7 +828,8 @@ export default function AsteroidShooter() {
     setShipPos({ x: window.innerWidth / 2, y: window.innerHeight / 2 });
     setShipVelocity({ x: 0, y: 0 });
     setLockedTarget(null);
-    setBeam({ active: false, startTime: 0, targetX: 0, targetY: 0, damage: 0 });
+    lockedTargetRef.current = null;
+    setBeams([]);
     setIsCharging(false);
     setInvincible(false);
     keysPressed.current.clear();
@@ -772,6 +840,7 @@ export default function AsteroidShooter() {
     nextBulletId.current = 0;
     nextParticleId.current = 0;
     nextPowerUpId.current = 0;
+    nextBeamId.current = 0;
   };
 
   const resetGame = () => {
@@ -788,7 +857,8 @@ export default function AsteroidShooter() {
     setShipPos({ x: window.innerWidth / 2, y: window.innerHeight / 2 });
     setShipVelocity({ x: 0, y: 0 });
     setLockedTarget(null);
-    setBeam({ active: false, startTime: 0, targetX: 0, targetY: 0, damage: 0 });
+    lockedTargetRef.current = null;
+    setBeams([]);
     setIsCharging(false);
     setInvincible(false);
     keysPressed.current.clear();
@@ -799,6 +869,7 @@ export default function AsteroidShooter() {
     nextBulletId.current = 0;
     nextParticleId.current = 0;
     nextPowerUpId.current = 0;
+    nextBeamId.current = 0;
   };
 
   // Helper functions
@@ -827,6 +898,36 @@ export default function AsteroidShooter() {
       case 'spread': return '◈';
       case 'health': return '+';
     }
+  };
+
+  // Cheat menu toggle
+  useEffect(() => {
+    const handleCheatKey = (e: KeyboardEvent) => {
+      if (e.key.toLowerCase() === 'c') {
+        setShowCheatMenu(prev => !prev);
+      }
+    };
+    window.addEventListener('keydown', handleCheatKey);
+    return () => window.removeEventListener('keydown', handleCheatKey);
+  }, []);
+
+  // Cheat functions
+  const giveAllPowerUps = () => {
+    const now = Date.now();
+    setActivePowerUps([
+      { type: 'rapidfire', endTime: now + 30000, startTime: now },
+      { type: 'spread', endTime: now + 30000, startTime: now }
+    ]);
+    setShields(5);
+    setLives(5);
+  };
+
+  const clearAsteroids = () => {
+    setAsteroids([]);
+  };
+
+  const addScore = (amount: number) => {
+    setScore(s => s + amount);
   };
 
   if (!mounted) {
@@ -894,15 +995,13 @@ export default function AsteroidShooter() {
           <div className="absolute bottom-5 left-5 z-10 text-white font-mono text-sm opacity-70" style={{ textShadow: '2px 2px 4px rgba(0,0,0,0.8)' }}>
             <div>WASD / Arrow Keys: Move</div>
             <div>Mouse: Aim</div>
-            {!hasPowerUp('rapidfire') && !hasPowerUp('spread') ? (
-              <>
-                <div style={{ color: '#ffff00' }}>Click: Shoot (2 dmg)</div>
-                <div style={{ color: '#00ffff' }}>Hold: Beam (2-10 dmg)</div>
-              </>
-            ) : hasPowerUp('rapidfire') ? (
-              <div style={{ color: '#ffff00' }}>RAPID FIRE: Click fast!</div>
-            ) : (
-              <div style={{ color: '#ff00ff' }}>SPREAD SHOT: Shoots 3 bullets!</div>
+            <div style={{ color: '#ffff00' }}>Click: Shoot (2 dmg)</div>
+            <div style={{ color: '#00ffff' }}>Hold: Beam (2-10 dmg)</div>
+            {hasPowerUp('rapidfire') && (
+              <div style={{ color: '#ffff00', marginTop: '5px' }}>RAPID FIRE: Fast shots + 3x yellow beam!</div>
+            )}
+            {hasPowerUp('spread') && (
+              <div style={{ color: '#ff00ff', marginTop: '5px' }}>SPREAD: 3 bullets + wide beam (11-44 dmg)!</div>
             )}
             <div className="mt-2" style={{ color: '#ffaa00' }}>
               <div>Orange Line: Lead Target</div>
@@ -998,6 +1097,77 @@ export default function AsteroidShooter() {
           >
             PLAY AGAIN
           </button>
+        </div>
+      )}
+
+      {/* Cheat Menu */}
+      {showCheatMenu && (
+        <div className="absolute top-5 right-5 z-30 bg-black bg-opacity-90 border-2 border-cyan-400 rounded-lg p-4 text-white font-mono text-sm cursor-default">
+          <div className="text-cyan-400 font-bold mb-3 text-center">CHEAT MENU</div>
+          <div className="space-y-2">
+            <button
+              onClick={() => { setLives(l => Math.min(5, l + 1)); }}
+              className="w-full px-3 py-1 bg-green-600 hover:bg-green-700 rounded transition-colors cursor-pointer"
+            >
+              + Life
+            </button>
+            <button
+              onClick={() => { setShields(s => Math.min(5, s + 1)); }}
+              className="w-full px-3 py-1 bg-blue-600 hover:bg-blue-700 rounded transition-colors cursor-pointer"
+            >
+              + Shield
+            </button>
+            
+            <div className="text-cyan-400 text-xs mt-2 mb-1">Power-ups:</div>
+            
+            <button
+              onClick={() => {
+                const now = Date.now();
+                setActivePowerUps(prev => [
+                  ...prev.filter(p => p.type !== 'rapidfire'),
+                  { type: 'rapidfire', endTime: now + 30000, startTime: now }
+                ]);
+              }}
+              className="w-full px-3 py-1 bg-yellow-600 hover:bg-yellow-700 rounded transition-colors cursor-pointer"
+            >
+              Rapid Fire
+            </button>
+            
+            <button
+              onClick={() => {
+                const now = Date.now();
+                setActivePowerUps(prev => [
+                  ...prev.filter(p => p.type !== 'spread'),
+                  { type: 'spread', endTime: now + 30000, startTime: now }
+                ]);
+              }}
+              className="w-full px-3 py-1 bg-purple-600 hover:bg-purple-700 rounded transition-colors cursor-pointer"
+            >
+              Spread Shot
+            </button>
+            
+            <div className="text-cyan-400 text-xs mt-2 mb-1">Game:</div>
+            
+            <button
+              onClick={clearAsteroids}
+              className="w-full px-3 py-1 bg-red-600 hover:bg-red-700 rounded transition-colors cursor-pointer"
+            >
+              Clear Asteroids
+            </button>
+            <button
+              onClick={() => addScore(1000)}
+              className="w-full px-3 py-1 bg-yellow-700 hover:bg-yellow-800 rounded transition-colors cursor-pointer"
+            >
+              +1000 Score
+            </button>
+            <button
+              onClick={() => setInvincible(!invincible)}
+              className="w-full px-3 py-1 bg-orange-600 hover:bg-orange-700 rounded transition-colors cursor-pointer"
+            >
+              {invincible ? 'Invincible: ON' : 'Invincible: OFF'}
+            </button>
+          </div>
+          <div className="text-gray-400 text-xs mt-3 text-center">Press C to close</div>
         </div>
       )}
 
@@ -1138,49 +1308,63 @@ export default function AsteroidShooter() {
             />
           ))}
 
-          {/* Beam Weapon */}
-          {(beam.active || isCharging) && (
+          {/* Beam Weapons */}
+          {(beams.length > 0 || isCharging) && (
             <svg className="absolute top-0 left-0 w-full h-full pointer-events-none">
-              {beam.active ? (
-                <>
-                  <line
-                    x1={shipPos.x}
-                    y1={shipPos.y}
-                    x2={beam.targetX}
-                    y2={beam.targetY}
-                    stroke="cyan"
-                    strokeWidth={Math.min(20, 5 + beam.damage * 1.5)}
-                    opacity="0.8"
-                    strokeLinecap="round"
-                    filter="url(#glow)"
-                  />
-                  <line
-                    x1={shipPos.x}
-                    y1={shipPos.y}
-                    x2={beam.targetX}
-                    y2={beam.targetY}
-                    stroke="white"
-                    strokeWidth={Math.min(10, 2 + beam.damage * 0.8)}
-                    opacity="1"
-                    strokeLinecap="round"
-                  />
-                  <defs>
-                    <filter id="glow">
-                      <feGaussianBlur stdDeviation="3" result="coloredBlur"/>
-                      <feMerge>
-                        <feMergeNode in="coloredBlur"/>
-                        <feMergeNode in="SourceGraphic"/>
-                      </feMerge>
-                    </filter>
-                  </defs>
-                </>
-              ) : (
+              {/* Render all active beams */}
+              {beams.map(beam => {
+                // Calculate width based on damage for spread shot
+                let outerWidth, innerWidth;
+                
+                if (hasPowerUp('spread')) {
+                  // Scale from narrow (at 11 dmg) to wide (at 44 dmg)
+                  const damageRatio = Math.min(1, (beam.damage - 11) / (44 - 11));
+                  outerWidth = 10 + (damageRatio * 40); // 10 to 50
+                  innerWidth = 5 + (damageRatio * 20); // 5 to 25
+                } else if (hasPowerUp('rapidfire')) {
+                  outerWidth = Math.min(20, 5 + beam.damage * 1.5);
+                  innerWidth = Math.min(10, 2 + beam.damage * 0.8);
+                } else {
+                  // Normal beam
+                  outerWidth = Math.min(20, 5 + beam.damage * 1.5);
+                  innerWidth = Math.min(10, 2 + beam.damage * 0.8);
+                }
+                
+                return (
+                  <g key={beam.id}>
+                    <line
+                      x1={shipPos.x}
+                      y1={shipPos.y}
+                      x2={beam.targetX}
+                      y2={beam.targetY}
+                      stroke={hasPowerUp('rapidfire') ? '#ffff00' : hasPowerUp('spread') ? '#ff00ff' : 'cyan'}
+                      strokeWidth={outerWidth}
+                      opacity="0.8"
+                      strokeLinecap="round"
+                      filter="url(#glow)"
+                    />
+                    <line
+                      x1={shipPos.x}
+                      y1={shipPos.y}
+                      x2={beam.targetX}
+                      y2={beam.targetY}
+                      stroke="white"
+                      strokeWidth={innerWidth}
+                      opacity="1"
+                      strokeLinecap="round"
+                    />
+                  </g>
+                );
+              })}
+              
+              {/* Charging indicator */}
+              {isCharging && (
                 <line
                   x1={shipPos.x}
                   y1={shipPos.y}
-                  x2={beam.targetX}
-                  y2={beam.targetY}
-                  stroke="#00ffff"
+                  x2={mousePos.x}
+                  y2={mousePos.y}
+                  stroke={hasPowerUp('rapidfire') ? '#ffff00' : hasPowerUp('spread') ? '#ff00ff' : '#00ffff'}
                   strokeWidth="2"
                   opacity="0.5"
                   strokeDasharray="5,5"
@@ -1193,7 +1377,24 @@ export default function AsteroidShooter() {
                   />
                 </line>
               )}
+              
+              <defs>
+                <filter id="glow">
+                  <feGaussianBlur stdDeviation="3" result="coloredBlur"/>
+                  <feMerge>
+                    <feMergeNode in="coloredBlur"/>
+                    <feMergeNode in="SourceGraphic"/>
+                  </feMerge>
+                </filter>
+              </defs>
             </svg>
+          )}
+
+          {/* Debug Info */}
+          {hasPowerUp('spread') && (
+            <div className="absolute top-20 left-5 z-10 text-white font-mono text-xs bg-black bg-opacity-50 p-2 rounded">
+              Last beam damage: {beams.length > 0 ? beams[beams.length - 1].damage.toFixed(1) : 'N/A'}
+            </div>
           )}
 
           {/* Charge Indicator */}
@@ -1204,11 +1405,15 @@ export default function AsteroidShooter() {
                    top: shipPos.y - 40,
                    transform: 'translateX(-50%)'
                  }}>
-              <div className="w-15 h-2 bg-black bg-opacity-50 border border-cyan-400 rounded overflow-hidden">
-                <div className="h-full bg-cyan-400 transition-all duration-50"
+              <div className="w-15 h-2 bg-black bg-opacity-50 rounded overflow-hidden"
+                   style={{
+                     border: `1px solid ${hasPowerUp('rapidfire') ? '#ffff00' : hasPowerUp('spread') ? '#ff00ff' : 'cyan'}`
+                   }}>
+                <div className="h-full transition-all duration-50"
                      style={{
-                       width: `${Math.min(100, ((Date.now() - mouseDownTime.current) / 1000) * 100)}%`,
-                       boxShadow: '0 0 10px cyan'
+                       width: `${Math.min(100, ((Date.now() - mouseDownTime.current) / (hasPowerUp('rapidfire') ? 500 : hasPowerUp('spread') ? 4000 : 1000)) * 100)}%`,
+                       backgroundColor: hasPowerUp('rapidfire') ? '#ffff00' : hasPowerUp('spread') ? '#ff00ff' : 'cyan',
+                       boxShadow: `0 0 10px ${hasPowerUp('rapidfire') ? '#ffff00' : hasPowerUp('spread') ? '#ff00ff' : 'cyan'}`
                      }} />
               </div>
             </div>
