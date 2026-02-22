@@ -5,1855 +5,1362 @@ import TargetCursor from '@/components/TargetCursor';
 import PixelSnow from '@/app/components/snow';
 
 interface Asteroid {
-  id: number;
-  x: number;
-  y: number;
-  size: number;
-  speedX: number;
-  speedY: number;
-  rotation: number;
-  rotationSpeed: number;
-  hp: number;
-  maxHp: number;
-  type: 'normal' | 'fast' | 'armored' | 'splitting';
+  id: number; x: number; y: number; size: number;
+  speedX: number; speedY: number; rotation: number; rotationSpeed: number;
+  hp: number; maxHp: number; type: 'normal' | 'fast' | 'armored' | 'splitting';
+}
+interface Bullet { id: number; x: number; y: number; vx: number; vy: number; }
+interface EnemyBullet { id: number; x: number; y: number; vx: number; vy: number; damage: number; color?: string; }
+interface EnemyShip { id: number; x: number; y: number; hp: number; maxHp: number; shield: number; maxShield: number; vx: number; vy: number; rotation: number; lastShot: number; type: 'fighter' | 'sniper' | 'captain' | 'aggressive' | 'grenadier'; charging: boolean; chargeUntil: number; freezeLeadMs: number; aimX: number; aimY: number; shotX: number; shotY: number; }
+interface EnemyBeam { id: number; x1: number; y1: number; x2: number; y2: number; expiresAt: number; type: 'telegraph' | 'sniper'; }
+interface EnemyMissile { id: number; x: number; y: number; vx: number; vy: number; born: number; trackUntil: number; }
+interface Particle { id: number; x: number; y: number; vx: number; vy: number; life: number; size: number; color?: string; }
+interface PowerUp { id: number; x: number; y: number; type: 'shield' | 'rapidfire' | 'spread' | 'health' | 'overshield'; }
+interface ActivePowerUp { type: PowerUp['type']; endTime: number; startTime: number; }
+interface Beam { id: number; targetX: number; targetY: number; damage: number; }
+interface Missile { id: number; x: number; y: number; vx: number; vy: number; targetId: number; targetType: 'asteroid' | 'ship'; born: number; }
+interface AsteroidSpec { type: Asteroid['type']; size: number; hp: number; speedMul: number; }
+
+// ── All mutable game state lives here, outside React ──
+const G = {
+  asteroids: [] as Asteroid[],
+  bullets: [] as Bullet[],
+  enemyBullets: [] as EnemyBullet[],
+  enemyBeams: [] as EnemyBeam[],
+  enemyMissiles: [] as EnemyMissile[],
+  enemyShips: [] as EnemyShip[],
+  particles: [] as Particle[],
+  powerUps: [] as PowerUp[],
+  activePowerUps: [] as ActivePowerUp[],
+  beams: [] as Beam[],
+  missiles: [] as Missile[],
+  ship: { x: 0, y: 0 },
+  vel: { x: 0, y: 0 },
+  mouse: { x: 0, y: 0 },
+  hp: 100,
+  playerShield: 0,
+  playerBaseShieldMax: 100,
+  playerOverShieldMax: 100,
+  deathsDefied: 1,
+  score: 0,
+  invincible: false,
+  deathDefied: false,
+  timeSlow: false,
+  timeSlowCooldown: 0,
+  missileCooldown: 0,
+  nextId: 0,
+  lastShot: 0,
+  lastHit: 0,
+  lastPlayerDamageAt: 0,
+  lastShieldRegenAt: 0,
+  wave: 0,
+  waveSpawnEndsAt: 0,
+  waveEndCuePlayed: true,
+  firstCaptainOverShieldDropped: false,
+  running: false,
+};
+
+function id() { return G.nextId++; }
+
+function dist(ax: number, ay: number, bx: number, by: number) {
+  const dx = ax - bx, dy = ay - by;
+  return Math.hypot(dx, dy);
 }
 
-interface Bullet {
-  id: number;
-  x: number;
-  y: number;
-  velocityX: number;
-  velocityY: number;
+function pointToSegmentDistance(px: number, py: number, x1: number, y1: number, x2: number, y2: number) {
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  const lenSq = dx * dx + dy * dy;
+  if (lenSq === 0) return dist(px, py, x1, y1);
+  const t = Math.max(0, Math.min(1, ((px - x1) * dx + (py - y1) * dy) / lenSq));
+  const cx = x1 + t * dx;
+  const cy = y1 + t * dy;
+  return dist(px, py, cx, cy);
 }
 
-interface Particle {
-  id: number;
-  x: number;
-  y: number;
-  velocityX: number;
-  velocityY: number;
-  life: number;
-  size: number;
-  color?: string;
+function enemyShipReward(type: EnemyShip['type']) {
+  if (type === 'captain') return 240;
+  if (type === 'sniper') return 180;
+  if (type === 'grenadier') return 170;
+  if (type === 'aggressive') return 120;
+  return 150;
 }
 
-interface BeamWeapon {
-  id: number;
-  active: boolean;
-  startTime: number;
-  targetX: number;
-  targetY: number;
-  damage: number;
+function enemyShipDropChance(type: EnemyShip['type']) {
+  if (type === 'captain') return 0.4;
+  if (type === 'grenadier') return 0.26;
+  if (type === 'aggressive') return 0.22;
+  return 0.3;
 }
 
-interface PowerUp {
-  id: number;
-  x: number;
-  y: number;
-  type: 'shield' | 'rapidfire' | 'spread' | 'health';
-  speedY: number;
+function shouldDropOverShield(type: EnemyShip['type']) {
+  if (type !== 'captain') return false;
+  if (!G.firstCaptainOverShieldDropped) {
+    G.firstCaptainOverShieldDropped = true;
+    return true;
+  }
+  return Math.random() < 0.2;
 }
 
-interface ActivePowerUp {
-  type: string;
-  endTime: number;
-  startTime: number; // Track when power-up was activated for spin-up
+function damageEnemyShip(ship: EnemyShip, damage: number) {
+  if (ship.shield > 0) {
+    const absorbed = Math.min(ship.shield, damage);
+    const remaining = damage - absorbed;
+    return { ...ship, shield: ship.shield - absorbed, hp: ship.hp - remaining };
+  }
+  return { ...ship, hp: ship.hp - damage };
 }
 
-interface Missile {
-  id: number;
-  x: number;
-  y: number;
-  velocityX: number;
-  velocityY: number;
-  targetId: number;
-  spawnTime: number; // Track when missile was spawned for acceleration
+function hasPU(type: string) {
+  return G.activePowerUps.some(p => p.type === type && Date.now() < p.endTime);
 }
+
+function spawnParticles(x: number, y: number, count = 8, color?: string) {
+  for (let i = 0; i < count; i++) {
+    const a = (Math.PI * 2 * i) / count;
+    const s = 2 + Math.random() * 3;
+    G.particles.push({ id: id(), x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: 1, size: 3 + Math.random() * 3, color });
+  }
+}
+
+function spawnPowerUp(x: number, y: number) {
+  const types: PowerUp['type'][] = ['rapidfire', 'spread', 'health'];
+  G.powerUps.push({ id: id(), x, y, type: types[Math.floor(Math.random() * 3)] });
+}
+
+function spawnAsteroidPowerUp(x: number, y: number) {
+  const types: PowerUp['type'][] = ['rapidfire', 'spread', 'health'];
+  G.powerUps.push({ id: id(), x, y, type: types[Math.floor(Math.random() * 3)] });
+}
+
+function spawnOverShieldPowerUp(x: number, y: number) {
+  G.powerUps.push({ id: id(), x, y, type: 'overshield' });
+}
+
+function asteroidColor(type: Asteroid['type']) {
+  if (type === 'fast') return '#00ffff';
+  if (type === 'armored') return '#ff8800';
+  if (type === 'splitting') return '#ff00ff';
+  return undefined;
+}
+
+function puColor(type: PowerUp['type']) {
+  if (type === 'shield') return '#00ccff';
+  if (type === 'overshield') return '#00ff66';
+  if (type === 'rapidfire') return '#ffff00';
+  if (type === 'spread') return '#ff00ff';
+  return '#00ff00';
+}
+
+function hpColor(current: number, max: number) {
+  if (current > max * 0.5) return '#0f0';
+  if (current > max * 0.25) return '#ff0';
+  return '#f44';
+}
+
+function scoreMessage(score: number) {
+  if (score > 500) return 'Excellent!';
+  if (score > 300) return 'Great job!';
+  if (score > 100) return 'Good try!';
+  return 'Keep practicing!';
+}
+
+function powerUpIcon(type: PowerUp['type']) {
+  if (type === 'shield') return '🛡';
+  if (type === 'overshield') return '⬢';
+  if (type === 'rapidfire') return '⚡';
+  if (type === 'spread') return '◈';
+  return '+';
+}
+
+function asteroidStrokeColor(type: Asteroid['type']) {
+  if (type === 'fast') return '#0ff';
+  if (type === 'armored') return '#f80';
+  if (type === 'splitting') return '#f0f';
+  return 'white';
+}
+
+function normalAsteroidHp(size: number) {
+  if (size > 60) return 8;
+  if (size > 50) return 5;
+  if (size > 40) return 3;
+  return 2;
+}
+
+function asteroidSpecFromRoll(r: number): AsteroidSpec {
+  if (r < 0.6) {
+    const size = 30 + Math.random() * 40;
+    return { type: 'normal', size, hp: normalAsteroidHp(size), speedMul: 1 };
+  }
+  if (r < 0.8) {
+    return { type: 'fast', size: 20 + Math.random() * 20, hp: 2, speedMul: 2 };
+  }
+  if (r < 0.95) {
+    return { type: 'armored', size: 60 + Math.random() * 20, hp: 15, speedMul: 0.5 };
+  }
+  return { type: 'splitting', size: 40 + Math.random() * 20, hp: 4, speedMul: 1 };
+}
+
+const TIME_SLOW_ANGLES = [0, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330];
 
 export default function AsteroidShooter() {
-  const [score, setScore] = useState(0);
-  const [lives, setLives] = useState(3);
-  const [shields, setShields] = useState(0); // Shield count (max 5)
-  const [gameOver, setGameOver] = useState(false);
+  const [tick, setTick] = useState(0); // force re-render
   const [gameStarted, setGameStarted] = useState(false);
-  const [asteroids, setAsteroids] = useState<Asteroid[]>([]);
-  const [bullets, setBullets] = useState<Bullet[]>([]);
-  const [missiles, setMissiles] = useState<Missile[]>([]);
-  const [particles, setParticles] = useState<Particle[]>([]);
-  const [powerUps, setPowerUps] = useState<PowerUp[]>([]);
-  const [activePowerUps, setActivePowerUps] = useState<ActivePowerUp[]>([]);
-  const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
-  const [shipPos, setShipPos] = useState({ x: 0, y: 0 });
-  const [shipVelocity, setShipVelocity] = useState({ x: 0, y: 0 });
-  const [lockedTarget, setLockedTarget] = useState<Asteroid | null>(null);
+  const [gameOver, setGameOver] = useState(false);
   const [mounted, setMounted] = useState(false);
-  const [beams, setBeams] = useState<BeamWeapon[]>([]);
   const [isCharging, setIsCharging] = useState(false);
-  const [invincible, setInvincible] = useState(false);
-  const [showCheatMenu, setShowCheatMenu] = useState(false);
-  
-  // Abilities
-  const [timeSlowActive, setTimeSlowActive] = useState(false);
-  const [timeSlowEndTime, setTimeSlowEndTime] = useState(0);
-  const [timeSlowCooldown, setTimeSlowCooldown] = useState(0);
-  
-  const [missileBarrageCooldown, setMissileBarrageCooldown] = useState(0);
-  
-  const [magnetActive, setMagnetActive] = useState(false);
-  const [magnetEndTime, setMagnetEndTime] = useState(0);
-  
-  const keysPressed = useRef<Set<string>>(new Set());
-  const mouseDownTime = useRef<number>(0);
-  const beamInterval = useRef<number>(0);
-  const lastCollisionTime = useRef<number>(0);
-  const lastShotTime = useRef<number>(0);
-  const currentMousePos = useRef({ x: 0, y: 0 });
-  const lockedTargetRef = useRef<Asteroid | null>(null);
-  
-  const nextAsteroidId = useRef(0);
-  const nextBulletId = useRef(0);
-  const nextMissileId = useRef(0);
-  const nextParticleId = useRef(0);
-  const nextPowerUpId = useRef(0);
-  const nextBeamId = useRef(0);
-  const gameLoopRef = useRef<number>(0);
-  const activePowerUpsRef = useRef<ActivePowerUp[]>([]);
 
-  // Keep ref in sync with state
-  useEffect(() => {
-    activePowerUpsRef.current = activePowerUps;
-  }, [activePowerUps]);
+  const rafRef = useRef(0);
+  const keys = useRef(new Set<string>());
+  const mouseDownAt = useRef(0);
+  const gameOverRef = useRef(false);
+  const timeoutIds = useRef<Array<ReturnType<typeof globalThis.setTimeout>>>([]);
 
-  // Ability: Time Slow (E key) - Defensive
-  const activateTimeSlow = useCallback(() => {
-    if (!gameStarted || gameOver) return;
-    const now = Date.now();
-    
-    if (now < timeSlowCooldown) return; // On cooldown
-    
-    setTimeSlowActive(true);
-    setTimeSlowEndTime(now + 3500); // 3.5 seconds duration
-    setTimeSlowCooldown(now + 10000); // 10 second cooldown
-    
-    setTimeout(() => {
-      setTimeSlowActive(false);
-    }, 3500);
-  }, [gameStarted, gameOver, timeSlowCooldown]);
-
-  // Ability: Missile Barrage (Q key) - Offensive
-  const activateMissileBarrage = useCallback(() => {
-    if (!gameStarted || gameOver) return;
-    const now = Date.now();
-    
-    if (now < missileBarrageCooldown) return; // On cooldown
-    
-    setMissileBarrageCooldown(now + 5000); // 5 second cooldown
-    
-    // Fire up to 3 missiles at random asteroids
-    const targets = [...asteroids].sort(() => Math.random() - 0.5).slice(0, Math.min(3, asteroids.length));
-    
-    targets.forEach((target, index) => {
-      setTimeout(() => {
-        const missile: Missile = {
-          id: nextMissileId.current++,
-          x: shipPos.x,
-          y: shipPos.y,
-          velocityX: 0,
-          velocityY: 0,
-          targetId: target.id,
-          spawnTime: Date.now()
-        };
-        setMissiles(prev => [...prev, missile]);
-      }, index * 100); // Stagger launches by 100ms
-    });
-  }, [gameStarted, gameOver, missileBarrageCooldown, asteroids, shipPos]);
-
-  // Ability: Magnet (Utility pickup) - Already handled in power-up system
-  // This will be a power-up drop like shield/health
-
-  // Initialize after mount to avoid SSR issues
-  useEffect(() => {
-    setMounted(true);
-    setShipPos({ x: window.innerWidth / 2, y: window.innerHeight / 2 });
+  const scheduleTimeout = useCallback((callback: () => void, delay: number) => {
+    const timeoutId = globalThis.setTimeout(() => {
+      timeoutIds.current = timeoutIds.current.filter(id => id !== timeoutId);
+      callback();
+    }, delay);
+    timeoutIds.current.push(timeoutId);
+    return timeoutId;
   }, []);
 
-  // Check if power-up is active
-  const hasPowerUp = useCallback((type: string) => {
-    return activePowerUps.some(p => p.type === type && Date.now() < p.endTime);
-  }, [activePowerUps]);
-
-  // Spawn power-up
-  const spawnPowerUp = useCallback((x: number, y: number) => {
-    const types: PowerUp['type'][] = ['shield', 'rapidfire', 'spread', 'health'];
-    const type = types[Math.floor(Math.random() * types.length)];
-    
-    const newPowerUp: PowerUp = {
-      id: nextPowerUpId.current++,
-      x,
-      y,
-      type,
-      speedY: 0.3 + Math.random() * 0.5 // Reduced from 1 + Math.random() * 1.5
-    };
-    
-    setPowerUps(prev => [...prev, newPowerUp]);
-  }, []);
-
-  // Spawn smaller asteroids when splitting type is destroyed
-  const spawnSplitAsteroids = useCallback((x: number, y: number, count: number = 3) => {
-    const newAsteroids: Asteroid[] = [];
-    for (let i = 0; i < count; i++) {
-      const angle = (Math.PI * 2 * i) / count + Math.random() * 0.5;
-      const speed = 1 + Math.random() * 1.5;
-      
-      newAsteroids.push({
-        id: nextAsteroidId.current++,
-        x,
-        y,
-        size: 20,
-        speedX: Math.cos(angle) * speed,
-        speedY: Math.sin(angle) * speed,
-        rotation: Math.random() * 360,
-        rotationSpeed: (Math.random() - 0.5) * 3,
-        hp: 1,
-        maxHp: 1,
-        type: 'fast'
-      });
+  const clearAllTimeouts = useCallback(() => {
+    for (const timeoutId of timeoutIds.current) {
+      globalThis.clearTimeout(timeoutId);
     }
-    setAsteroids(prev => [...prev, ...newAsteroids]);
+    timeoutIds.current = [];
   }, []);
 
-  // Spawn asteroids with different types
+  const scheduleBeamRemoval = useCallback((beamId: number, delay: number) => {
+    scheduleTimeout(() => {
+      G.beams = G.beams.filter(beam => beam.id !== beamId);
+    }, delay);
+  }, [scheduleTimeout]);
+
+  const scheduleMissileLaunch = useCallback((targetId: number, delay: number) => {
+    scheduleTimeout(() => {
+      G.missiles.push({ id: id(), x: G.ship.x, y: G.ship.y, vx: 0, vy: 0, targetId, targetType: 'asteroid', born: Date.now() });
+    }, delay);
+  }, [scheduleTimeout]);
+
+  const scheduleMissileLaunchToTarget = useCallback((targetId: number, targetType: Missile['targetType'], delay: number) => {
+    scheduleTimeout(() => {
+      G.missiles.push({ id: id(), x: G.ship.x, y: G.ship.y, vx: 0, vy: 0, targetId, targetType, born: Date.now() });
+    }, delay);
+  }, [scheduleTimeout]);
+
+  const playWaveMusicCue = useCallback((_cueType: 'incoming' | 'start' | 'end', _waveNumber: number) => {
+  }, []);
+
+  useEffect(() => { setMounted(true); }, []);
+
+  // ── takeDamage: runs synchronously in game loop ──
+  const takeDamage = useCallback((amount: number) => {
+    if (G.invincible) return;
+    const now = Date.now();
+    G.lastPlayerDamageAt = now;
+    G.lastShieldRegenAt = now;
+    let remainingDamage = amount;
+    if (G.playerShield > 0) {
+      const absorbed = Math.min(G.playerShield, remainingDamage);
+      G.playerShield -= absorbed;
+      remainingDamage -= absorbed;
+    }
+    if (remainingDamage <= 0) return;
+    G.hp -= remainingDamage;
+    if (G.hp <= 0) {
+      if (G.deathsDefied > 0) {
+        G.deathsDefied--;
+        G.hp = 100;
+        G.playerShield = 0;
+        G.invincible = true;
+        G.deathDefied = true;
+        scheduleTimeout(() => {
+          G.invincible = false;
+          G.deathDefied = false;
+        }, 3000);
+      } else {
+        G.running = false;
+        G.hp = 0;
+        gameOverRef.current = true;
+        cancelAnimationFrame(rafRef.current);
+        setGameOver(true);
+      }
+    }
+  }, [scheduleTimeout]);
+
+  // ── spawn helpers ──
   const spawnAsteroid = useCallback(() => {
     const side = Math.floor(Math.random() * 4);
-    let x, y, speedX, speedY;
-    
-    const speed = 0.3 + Math.random() * 0.5;
-    const angle = Math.random() * Math.PI * 2;
-    
-    switch(side) {
-      case 0: // top
-        x = Math.random() * window.innerWidth;
-        y = -50;
-        speedX = Math.cos(angle) * speed;
-        speedY = Math.abs(Math.sin(angle)) * speed;
-        break;
-      case 1: // right
-        x = window.innerWidth + 50;
-        y = Math.random() * window.innerHeight;
-        speedX = -Math.abs(Math.cos(angle)) * speed;
-        speedY = Math.sin(angle) * speed;
-        break;
-      case 2: // bottom
-        x = Math.random() * window.innerWidth;
-        y = window.innerHeight + 50;
-        speedX = Math.cos(angle) * speed;
-        speedY = -Math.abs(Math.sin(angle)) * speed;
-        break;
-      default: // left
-        x = -50;
-        y = Math.random() * window.innerHeight;
-        speedX = Math.abs(Math.cos(angle)) * speed;
-        speedY = Math.sin(angle) * speed;
+    let x = 0, y = 0, sx = 0, sy = 0;
+    const spd = 0.3 + Math.random() * 0.5;
+    const ang = Math.random() * Math.PI * 2;
+    const W = window.innerWidth, H = window.innerHeight;
+    if (side === 0) { x = Math.random() * W; y = -50; sx = Math.cos(ang) * spd; sy = Math.abs(Math.sin(ang)) * spd; }
+    else if (side === 1) { x = W + 50; y = Math.random() * H; sx = -Math.abs(Math.cos(ang)) * spd; sy = Math.sin(ang) * spd; }
+    else if (side === 2) { x = Math.random() * W; y = H + 50; sx = Math.cos(ang) * spd; sy = -Math.abs(Math.sin(ang)) * spd; }
+    else { x = -50; y = Math.random() * H; sx = Math.abs(Math.cos(ang)) * spd; sy = Math.sin(ang) * spd; }
+    const spec = asteroidSpecFromRoll(Math.random());
+    G.asteroids.push({ id: id(), x, y, size: spec.size, speedX: sx * spec.speedMul, speedY: sy * spec.speedMul, rotation: Math.random() * 360, rotationSpeed: (Math.random() - 0.5) * 2, hp: spec.hp, maxHp: spec.hp, type: spec.type });
+  }, []);
+
+  const spawnEnemyShip = useCallback((forcedType?: EnemyShip['type']) => {
+    const side = Math.floor(Math.random() * 4);
+    const W = window.innerWidth, H = window.innerHeight;
+    let x = 0, y = 0;
+    if (side === 0) { x = Math.random() * W; y = -50; }
+    else if (side === 1) { x = W + 50; y = Math.random() * H; }
+    else if (side === 2) { x = Math.random() * W; y = H + 50; }
+    else { x = -50; y = Math.random() * H; }
+    const roll = Math.random();
+    let shipType: EnemyShip['type'] = forcedType ?? 'fighter';
+    if (!forcedType) {
+      if (roll < 0.2) shipType = 'sniper';
+      else if (roll < 0.4) shipType = 'captain';
+      else if (roll < 0.55) shipType = 'grenadier';
+      else if (roll < 0.75) shipType = 'aggressive';
     }
 
-    // Determine asteroid type (60% normal, 20% fast, 15% armored, 5% splitting)
-    const rand = Math.random();
-    let type: Asteroid['type'];
-    let size: number;
-    let baseHp: number;
-    let speedMultiplier = 1;
+    let hp = 10;
+    let shield = 0;
+    if (shipType === 'sniper') hp = 12;
+    else if (shipType === 'captain') { hp = 14; shield = 20; }
+    else if (shipType === 'grenadier') hp = 9;
+    else if (shipType === 'aggressive') hp = 6;
 
-    if (rand < 0.6) {
-      type = 'normal';
-      size = 30 + Math.random() * 40;
-      baseHp = size >= 60 ? 8 : size >= 50 ? 5 : size >= 40 ? 3 : 2;
-    } else if (rand < 0.8) {
-      type = 'fast';
-      size = 20 + Math.random() * 20;
-      baseHp = 2;
-      speedMultiplier = 2;
-    } else if (rand < 0.95) {
-      type = 'armored';
-      size = 60 + Math.random() * 20;
-      baseHp = 15;
-      speedMultiplier = 0.5;
+    hp = Math.round(hp * 1.3);
+
+    G.enemyShips.push({ id: id(), x, y, hp, maxHp: hp, shield, maxShield: shield, vx: 0, vy: 0, rotation: 0, lastShot: Date.now(), type: shipType, charging: false, chargeUntil: 0, freezeLeadMs: 0, aimX: 0, aimY: 0, shotX: 0, shotY: 0 });
+  }, []);
+
+  const spawnEnemyWave = useCallback((waveNumber: number) => {
+    let fighterCount: number;
+    let sniperCount: number;
+    let aggressiveCount: number;
+    let captainCount: number;
+    let grenadierCount: number;
+
+    if (waveNumber === 1) {
+      fighterCount = 3;
+      sniperCount = 1;
+      aggressiveCount = 0;
+      captainCount = 0;
+      grenadierCount = 0;
+    } else if (waveNumber === 2) {
+      fighterCount = 4;
+      sniperCount = 1;
+      aggressiveCount = 0;
+      captainCount = 0;
+      grenadierCount = 0;
+    } else if (waveNumber === 3) {
+      fighterCount = 5;
+      sniperCount = 1;
+      aggressiveCount = 0;
+      captainCount = 0;
+      grenadierCount = 0;
+    } else if (waveNumber === 4) {
+      fighterCount = 6;
+      sniperCount = 1;
+      aggressiveCount = 1;
+      captainCount = 0;
+      grenadierCount = 1;
+    } else if (waveNumber === 5) {
+      fighterCount = 6;
+      sniperCount = 2;
+      aggressiveCount = 1;
+      captainCount = 1;
+      grenadierCount = 1;
+    } else if (waveNumber === 6) {
+      fighterCount = 6;
+      sniperCount = 2;
+      aggressiveCount = 2;
+      captainCount = 1;
+      grenadierCount = 1;
     } else {
-      type = 'splitting';
-      size = 40 + Math.random() * 20;
-      baseHp = 4;
+      const rampLevel = 1 + Math.floor((waveNumber - 7) / 3.5);
+      fighterCount = 6;
+      sniperCount = Math.min(3, 2 + Math.floor(rampLevel / 1.2));
+      aggressiveCount = Math.min(2, 1 + Math.floor(rampLevel / 2));
+      captainCount = Math.min(2, 1 + Math.floor(rampLevel / 2));
+      grenadierCount = Math.min(2, 1 + Math.floor(rampLevel / 2.5));
     }
 
-    const newAsteroid: Asteroid = {
-      id: nextAsteroidId.current++,
-      x,
-      y,
-      size,
-      speedX: speedX * speedMultiplier,
-      speedY: speedY * speedMultiplier,
-      rotation: Math.random() * 360,
-      rotationSpeed: (Math.random() - 0.5) * 2,
-      hp: baseHp,
-      maxHp: baseHp,
-      type
-    };
+    const waveShips: EnemyShip['type'][] = [];
+    for (let i = 0; i < fighterCount; i++) waveShips.push('fighter');
+    for (let i = 0; i < sniperCount; i++) waveShips.push('sniper');
+    for (let i = 0; i < aggressiveCount; i++) waveShips.push('aggressive');
+    for (let i = 0; i < captainCount; i++) waveShips.push('captain');
+    for (let i = 0; i < grenadierCount; i++) waveShips.push('grenadier');
 
-    setAsteroids(prev => [...prev, newAsteroid]);
-  }, []);
-
-  // Spawn particles for explosion effect
-  const spawnParticles = useCallback((x: number, y: number, count: number = 8, color?: string) => {
-    const newParticles: Particle[] = [];
-    for (let i = 0; i < count; i++) {
-      const angle = (Math.PI * 2 * i) / count;
-      const speed = 2 + Math.random() * 3;
-      newParticles.push({
-        id: nextParticleId.current++,
-        x,
-        y,
-        velocityX: Math.cos(angle) * speed,
-        velocityY: Math.sin(angle) * speed,
-        life: 1,
-        size: 3 + Math.random() * 3,
-        color: color || undefined
-      });
+    for (let i = waveShips.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const temp = waveShips[i];
+      waveShips[i] = waveShips[j];
+      waveShips[j] = temp;
     }
-    setParticles(prev => [...prev, ...newParticles]);
-  }, []);
 
-  // Shoot bullet (quick tap)
-  const shootBullet = useCallback((mouseX: number, mouseY: number) => {
-    if (gameOver || !gameStarted) return;
+    let spawnGap = 500;
+    if (waveNumber <= 3) {
+      spawnGap = 500;
+    } else if (waveNumber <= 6) {
+      spawnGap = 420;
+    } else {
+      spawnGap = Math.max(280, 380 - Math.floor((waveNumber - 6) * 6));
+    }
+    G.waveSpawnEndsAt = Date.now() + Math.max(0, waveShips.length - 1) * spawnGap + 600;
+    G.waveEndCuePlayed = false;
 
+    waveShips.forEach((shipType, index) => {
+      scheduleTimeout(() => {
+        if (!G.running) return;
+        spawnEnemyShip(shipType);
+      }, index * spawnGap);
+    });
+  }, [scheduleTimeout, spawnEnemyShip]);
+
+  // ── main game loop ──
+  const loop = useCallback(() => {
+    if (!G.running) return;
     const now = Date.now();
-    const hasRapid = hasPowerUp('rapidfire');
-    const hasSpread = hasPowerUp('spread');
-    
-    // Calculate fire rate with spin-up
-    let fireRate = 250; // Default
-    
-    if (hasRapid) {
-      // Rapid fire: 100ms -> 10ms over 15 seconds
-      const rapidPowerUp = activePowerUps.find(p => p.type === 'rapidfire' && now < p.endTime);
-      if (rapidPowerUp) {
-        const elapsedTime = now - rapidPowerUp.startTime;
-        const spinUpDuration = 15000; // 15 seconds to reach max speed
-        const progress = Math.min(1, elapsedTime / spinUpDuration);
-        
-        // Interpolate from 100ms to 10ms
-        fireRate = 100 - (progress * 90); // 100 -> 10
-        
-        console.log('Rapid Fire - elapsed:', (elapsedTime/1000).toFixed(1), 's, progress:', (progress*100).toFixed(1), '%, fireRate:', fireRate.toFixed(1), 'ms');
+    const slow = G.timeSlow || G.deathDefied ? 0.3 : 1;
+    const W = window.innerWidth, H = window.innerHeight;
+    const ship = G.ship;
+
+    // Ship movement
+    const accel = 0.3, maxS = 3, fric = 0.92;
+    if (keys.current.has('w') || keys.current.has('arrowup')) G.vel.y -= accel;
+    if (keys.current.has('s') || keys.current.has('arrowdown')) G.vel.y += accel;
+    if (keys.current.has('a') || keys.current.has('arrowleft')) G.vel.x -= accel;
+    if (keys.current.has('d') || keys.current.has('arrowright')) G.vel.x += accel;
+    G.vel.x *= fric; G.vel.y *= fric;
+    const spd = Math.hypot(G.vel.x, G.vel.y);
+    if (spd > maxS) { G.vel.x = G.vel.x / spd * maxS; G.vel.y = G.vel.y / spd * maxS; }
+    ship.x = Math.max(30, Math.min(W - 30, ship.x + G.vel.x));
+    ship.y = Math.max(30, Math.min(H - 30, ship.y + G.vel.y));
+
+    // Player shield recharge (base shield only)
+    if (now - G.lastPlayerDamageAt >= 4000 && G.playerShield < G.playerBaseShieldMax) {
+      const elapsedSeconds = (now - G.lastShieldRegenAt) / 1000;
+      if (elapsedSeconds > 0) {
+        G.playerShield = Math.min(G.playerBaseShieldMax, G.playerShield + elapsedSeconds * 3);
+        G.lastShieldRegenAt = now;
       }
-    } else if (hasSpread) {
-      // Spread shot: 250ms -> 150ms over 5 seconds
-      const spreadPowerUp = activePowerUps.find(p => p.type === 'spread' && now < p.endTime);
-      if (spreadPowerUp) {
-        const elapsedTime = now - spreadPowerUp.startTime;
-        const spinUpDuration = 5000; // 5 seconds to reach max speed
-        const progress = Math.min(1, elapsedTime / spinUpDuration);
-        
-        // Interpolate from 250ms to 150ms
-        fireRate = 250 - (progress * 100); // 250 -> 150
-        
-        console.log('Spread Shot - elapsed:', (elapsedTime/1000).toFixed(1), 's, progress:', (progress*100).toFixed(1), '%, fireRate:', fireRate.toFixed(1), 'ms');
-      }
-    }
-    
-    // Check if enough time has passed since last shot
-    const timeSinceLastShot = now - lastShotTime.current;
-    if (timeSinceLastShot < fireRate) {
-      console.log('Rate limited - need', fireRate.toFixed(1), 'ms, only', timeSinceLastShot.toFixed(1), 'ms passed');
-      return;
-    }
-    
-    lastShotTime.current = now;
-
-    const dx = mouseX - shipPos.x;
-    const dy = mouseY - shipPos.y;
-    const distance = Math.sqrt(dx * dx + dy * dy);
-    const speed = 6;
-
-    const bulletCount = hasSpread ? 3 : 1;
-    const spreadAngle = 0.3;
-
-    for (let i = 0; i < bulletCount; i++) {
-      const offset = hasSpread ? (i - 1) * spreadAngle : 0;
-      const angle = Math.atan2(dy, dx) + offset;
-      
-      const newBullet: Bullet = {
-        id: nextBulletId.current++,
-        x: shipPos.x,
-        y: shipPos.y,
-        velocityX: Math.cos(angle) * speed,
-        velocityY: Math.sin(angle) * speed
-      };
-
-      setBullets(prev => [...prev, newBullet]);
-    }
-    
-    console.log('FIRED! Next shot in', fireRate.toFixed(1), 'ms');
-  }, [gameOver, gameStarted, shipPos, hasPowerUp, activePowerUps]);
-
-  // Handle mouse down - start charging
-  const handleMouseDown = useCallback((e: MouseEvent) => {
-    if (gameOver || !gameStarted) return;
-    
-    mouseDownTime.current = Date.now();
-    setIsCharging(true);
-  }, [gameOver, gameStarted]);
-
-  // Handle mouse up - fire beam or bullet (modified by power-ups)
-  const handleMouseUp = useCallback((e: MouseEvent) => {
-    if (gameOver || !gameStarted) return;
-    
-    const holdDuration = (Date.now() - mouseDownTime.current) / 1000;
-    setIsCharging(false);
-    
-    const hasRapid = hasPowerUp('rapidfire');
-    const hasSpread = hasPowerUp('spread');
-    
-    if (holdDuration < 0.1) {
-      // Quick tap - shoot bullet
-      shootBullet(e.clientX, e.clientY);
     } else {
-      // Held - fire beam (modified by power-ups)
-      let damage: number;
-      let maxDamage: number;
-      let chargeTime: number;
-      let beamColor: string = 'cyan';
-      
-      // Rapid fire modifies beam to fire 3 consecutive beams
-      if (hasRapid) {
-        maxDamage = 8;
-        chargeTime = 0.5; // 0.5 seconds to max charge
-        damage = Math.min(maxDamage, 2 + (holdDuration * (maxDamage - 2) / chargeTime));
-        beamColor = '#ffff00'; // Yellow
-        
-        // Fire 3 beams in quick succession
-        for (let i = 0; i < 3; i++) {
-          setTimeout(() => {
-            const beamId = nextBeamId.current++;
-            const newBeam: BeamWeapon = {
-              id: beamId,
-              active: true,
-              startTime: Date.now(),
-              targetX: e.clientX,
-              targetY: e.clientY,
-              damage: damage
-            };
-            
-            setBeams(prev => [...prev, newBeam]);
-            
-            // Remove beam after 120ms (so beams are distinct with 150ms spacing)
-            setTimeout(() => {
-              setBeams(prev => prev.filter(b => b.id !== beamId));
-            }, 120);
-          }, i * 150); // 150ms apart
-        }
-        
-        mouseDownTime.current = 0;
-        return;
-      }
-      // Spread shot modifies beam to be wider and more powerful
-      else if (hasSpread) {
-        chargeTime = 3.0; // 3 seconds to max charge
-        const baseDamage = 11;
-        // Use min to cap at 3 seconds, so damage caps at 44
-        const chargeProgress = Math.min(1, holdDuration / chargeTime);
-        const chargeMultiplier = 1 + (chargeProgress * 3); // 1x to 4x
-        damage = baseDamage * chargeMultiplier; // 11 to 44 damage
-        beamColor = '#ff00ff'; // Purple
-        
-        console.log('Spread Shot Beam - holdDuration:', holdDuration.toFixed(2), 's, chargeProgress:', (chargeProgress * 100).toFixed(1), '%, damage:', damage.toFixed(1));
-      }
-      // Normal beam
-      else {
-        maxDamage = 10;
-        chargeTime = 1.0;
-        damage = Math.min(maxDamage, 2 + (holdDuration * (maxDamage - 2) / chargeTime));
-      }
-      
-      const beamId = nextBeamId.current++;
-      const newBeam: BeamWeapon = {
-        id: beamId,
-        active: true,
-        startTime: Date.now(),
-        targetX: e.clientX,
-        targetY: e.clientY,
-        damage: damage
-      };
-      
-      setBeams(prev => [...prev, newBeam]);
-      
-      // Beam persists for 500ms (about 30 frames at 60fps)
-      setTimeout(() => {
-        setBeams(prev => prev.filter(b => b.id !== beamId));
-      }, 500);
+      G.lastShieldRegenAt = now;
     }
-    
-    mouseDownTime.current = 0;
-  }, [gameOver, gameStarted, shootBullet, hasPowerUp]);
 
-  // Track mouse position and keyboard
+    // Power-up expiry
+    G.activePowerUps = G.activePowerUps.filter(p => now < p.endTime);
+
+    // Floating power-ups
+    G.powerUps = G.powerUps.filter(p => {
+      if (dist(p.x, p.y, ship.x, ship.y) < 30) {
+        if (p.type === 'health') { G.hp = Math.min(100, G.hp + 30); }
+        else if (p.type === 'shield') { G.playerShield = Math.min(G.playerBaseShieldMax, G.playerShield + 40); }
+        else if (p.type === 'overshield') { G.playerShield = G.playerBaseShieldMax + G.playerOverShieldMax; }
+        else {
+          G.activePowerUps = G.activePowerUps.filter(a => a.type !== p.type && !(p.type === 'rapidfire' && a.type === 'spread') && !(p.type === 'spread' && a.type === 'rapidfire'));
+          G.activePowerUps.push({ type: p.type, endTime: now + 30000, startTime: now });
+        }
+        spawnParticles(p.x, p.y, 12, puColor(p.type));
+        return false;
+      }
+      return true;
+    });
+
+    // Asteroids
+    G.asteroids = G.asteroids.map(a => ({
+      ...a,
+      x: a.x + a.speedX * slow,
+      y: a.y + a.speedY * slow,
+      rotation: a.rotation + a.rotationSpeed,
+    })).filter(a => {
+      if (a.x < -150 || a.x > W + 150 || a.y < -150 || a.y > H + 150) return false;
+      // Ship collision
+      if (!G.invincible && dist(a.x, a.y, ship.x, ship.y) < a.size + 20) {
+        if (now - G.lastHit > 2000) {
+          G.lastHit = now;
+          takeDamage(20);
+          spawnParticles(a.x, a.y, 12);
+          if (!G.invincible) { G.invincible = true; scheduleTimeout(() => { G.invincible = false; }, 2000); }
+        }
+        return false;
+      }
+      return true;
+    });
+
+    // Bullets
+    G.bullets = G.bullets.map(b => ({ ...b, x: b.x + b.vx, y: b.y + b.vy }))
+      .filter(b => b.x > 0 && b.x < W && b.y > 0 && b.y < H);
+
+    // Missiles
+    G.missiles = G.missiles.map(m => {
+      const prog = Math.min(1, (now - m.born) / 1000);
+      const tgt = m.targetType === 'ship'
+        ? G.enemyShips.find(s => s.id === m.targetId)
+        : G.asteroids.find(a => a.id === m.targetId);
+      if (tgt) {
+        const ta = Math.atan2(tgt.y - m.y, tgt.x - m.x);
+        const ca = Math.atan2(m.vy, m.vx);
+        let diff = ta - ca;
+        while (diff > Math.PI) diff -= Math.PI * 2;
+        while (diff < -Math.PI) diff += Math.PI * 2;
+        const na = prog > 0.1 ? ca + diff * 0.15 : ta;
+        const s = 3.4 * prog;
+        return { ...m, x: m.x + Math.cos(na) * s, y: m.y + Math.sin(na) * s, vx: Math.cos(na) * s, vy: Math.sin(na) * s };
+      }
+      return { ...m, x: m.x + m.vx, y: m.y + m.vy };
+    }).filter(m => m.x > -50 && m.x < W + 50 && m.y > -50 && m.y < H + 50);
+
+    // Enemy ship vs asteroid collisions
+    const usedAsteroids = new Set<number>();
+    for (let si = G.enemyShips.length - 1; si >= 0; si--) {
+      const enemyShip = G.enemyShips[si];
+      for (let ai = G.asteroids.length - 1; ai >= 0; ai--) {
+        const a = G.asteroids[ai];
+        if (usedAsteroids.has(a.id)) continue;
+        if (dist(enemyShip.x, enemyShip.y, a.x, a.y) < a.size + 20) {
+          usedAsteroids.add(a.id);
+          G.enemyShips[si] = damageEnemyShip(enemyShip, 6);
+          G.asteroids[ai] = { ...a, hp: a.hp - 4 };
+          spawnParticles(a.x, a.y, 8, '#ff8844');
+          if (G.enemyShips[si].hp <= 0) {
+            spawnParticles(enemyShip.x, enemyShip.y, 12, '#ff6600');
+            G.score += enemyShipReward(enemyShip.type);
+            if (Math.random() < enemyShipDropChance(enemyShip.type)) spawnPowerUp(enemyShip.x, enemyShip.y);
+            if (shouldDropOverShield(enemyShip.type)) spawnOverShieldPowerUp(enemyShip.x, enemyShip.y);
+            G.enemyShips.splice(si, 1);
+            break;
+          }
+          if (G.asteroids[ai].hp <= 0) {
+            spawnParticles(a.x, a.y, 12, asteroidColor(a.type));
+            if (Math.random() < 0.2) spawnAsteroidPowerUp(a.x, a.y);
+            G.asteroids.splice(ai, 1);
+          }
+          break;
+        }
+      }
+    }
+
+    // Particles
+    G.particles = G.particles
+      .map(p => ({ ...p, x: p.x + p.vx, y: p.y + p.vy, life: p.life - 0.02, vx: p.vx * 0.98, vy: p.vy * 0.98 }))
+      .filter(p => p.life > 0);
+
+    // Enemy ship AI
+    G.enemyShips = G.enemyShips.map(s => {
+      const dx = ship.x - s.x, dy = ship.y - s.y;
+      const d = Math.hypot(dx, dy);
+      const isSniper = s.type === 'sniper';
+      const isCaptain = s.type === 'captain';
+      const isAggressive = s.type === 'aggressive';
+      const isGrenadier = s.type === 'grenadier';
+      let target = 300;
+      let maxSpd = 1.2;
+      let accelToward = 0.1;
+      let accelAway = 0.1;
+      if (isSniper) {
+        target = 600;
+        maxSpd = 1;
+        accelToward = 0.08;
+        accelAway = 0.12;
+      } else if (isCaptain) {
+        target = 360;
+        maxSpd = 0.75;
+        accelToward = 0.07;
+        accelAway = 0.07;
+      } else if (isAggressive) {
+        target = 130;
+        maxSpd = 2.1;
+        accelToward = 0.16;
+        accelAway = 0.05;
+      } else if (isGrenadier) {
+        target = 420;
+        maxSpd = 1;
+        accelToward = 0.09;
+        accelAway = 0.09;
+      }
+      let vx = s.vx, vy = s.vy;
+      if (d > 0) {
+        if (d > target + 50) {
+          vx += dx / d * accelToward;
+          vy += dy / d * accelToward;
+        } else if (d < target - 50) {
+          vx -= dx / d * accelAway;
+          vy -= dy / d * accelAway;
+        }
+      }
+      const sp = Math.hypot(vx, vy);
+      if (sp > maxSpd) { vx = vx / sp * maxSpd; vy = vy / sp * maxSpd; }
+      if (isSniper) {
+        const chargeRemaining = s.chargeUntil - now;
+        if (s.charging && chargeRemaining > 0 && chargeRemaining <= s.freezeLeadMs) {
+          vx = 0;
+          vy = 0;
+        }
+        if (s.charging && now >= s.chargeUntil) {
+          G.enemyBeams.push({ id: id(), x1: s.shotX, y1: s.shotY, x2: s.aimX, y2: s.aimY, expiresAt: now + 180, type: 'sniper' });
+          if (pointToSegmentDistance(ship.x, ship.y, s.shotX, s.shotY, s.aimX, s.aimY) < 26) {
+            takeDamage(30);
+            spawnParticles(ship.x, ship.y, 10, '#ff1177');
+          }
+          s = { ...s, lastShot: now, charging: false, freezeLeadMs: 0 };
+        } else if (!s.charging && now - s.lastShot > 1700 && d > 450) {
+          const chargeDuration = 1200;
+          const freezeLeadMs = 250;
+          G.enemyBeams.push({ id: id(), x1: s.x, y1: s.y, x2: ship.x, y2: ship.y, expiresAt: now + chargeDuration, type: 'telegraph' });
+          s = { ...s, charging: true, chargeUntil: now + chargeDuration, freezeLeadMs, aimX: ship.x, aimY: ship.y, shotX: s.x, shotY: s.y };
+        }
+      } else if (isCaptain && now - s.lastShot > 280 && d < 560) {
+        const a = Math.atan2(dy, dx);
+        G.enemyBullets.push({ id: id(), x: s.x, y: s.y, vx: Math.cos(a) * 5.4, vy: Math.sin(a) * 5.4, damage: 4, color: '#7dd3fc' });
+        s = { ...s, lastShot: now };
+      } else if (isAggressive && now - s.lastShot > 850 && d < 340) {
+        const baseA = Math.atan2(dy, dx);
+        const spread = 0.22;
+        for (let i = -2; i <= 2; i++) {
+          const a = baseA + i * spread;
+          G.enemyBullets.push({ id: id(), x: s.x, y: s.y, vx: Math.cos(a) * 4.5, vy: Math.sin(a) * 4.5, damage: 2, color: '#ff9933' });
+        }
+        s = { ...s, lastShot: now };
+      } else if (isGrenadier && now - s.lastShot > 5000 + Math.random() * 1000 && d < 550) {
+        const a = Math.atan2(dy, dx);
+        const speed = 2.8;
+        const trackDuration = 2000 + Math.random() * 1000;
+        G.enemyMissiles.push({ id: id(), x: s.x, y: s.y, vx: Math.cos(a) * speed, vy: Math.sin(a) * speed, born: now, trackUntil: now + trackDuration });
+        s = { ...s, lastShot: now };
+      } else if (!isSniper && !isCaptain && !isAggressive && !isGrenadier && now - s.lastShot > 500 && d < 500) {
+        const a = Math.atan2(dy, dx);
+        G.enemyBullets.push({ id: id(), x: s.x, y: s.y, vx: Math.cos(a) * 4, vy: Math.sin(a) * 4, damage: 3, color: '#ff4444' });
+        s = { ...s, lastShot: now };
+      }
+      return { ...s, x: s.x + vx, y: s.y + vy, vx, vy, rotation: Math.atan2(dy, dx) * 180 / Math.PI + 90 };
+    }).filter(s => s.x > -200 && s.x < W + 200 && s.y > -200 && s.y < H + 200);
+
+    // Enemy beams (visual lifetime)
+    G.enemyBeams = G.enemyBeams.filter(beam => now < beam.expiresAt);
+
+    if (!G.waveEndCuePlayed && G.wave > 0 && now >= G.waveSpawnEndsAt && G.enemyShips.length === 0) {
+      playWaveMusicCue('end', G.wave);
+      G.waveEndCuePlayed = true;
+    }
+
+    // Enemy bullets
+    G.enemyBullets = G.enemyBullets
+      .map(b => ({ ...b, x: b.x + b.vx, y: b.y + b.vy }))
+      .filter(b => {
+        if (b.x < 0 || b.x > W || b.y < 0 || b.y > H) return false;
+        if (!G.invincible && dist(b.x, b.y, ship.x, ship.y) < 20) {
+          takeDamage(b.damage);
+          spawnParticles(ship.x, ship.y, 6, '#ff4444');
+          return false;
+        }
+        return true;
+      });
+
+    // Enemy missiles (homing)
+    G.enemyMissiles = G.enemyMissiles.map(m => {
+      let newVx = m.vx;
+      let newVy = m.vy;
+      if (now < m.trackUntil) {
+        const dx = ship.x - m.x;
+        const dy = ship.y - m.y;
+        const targetAngle = Math.atan2(dy, dx);
+        const currentAngle = Math.atan2(m.vy, m.vx);
+        let angleDiff = targetAngle - currentAngle;
+        while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
+        while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
+        const turnRate = 0.08 + Math.random() * 0.04;
+        const jitter = (Math.random() - 0.5) * 0.1;
+        const newAngle = currentAngle + angleDiff * turnRate + jitter;
+        const speed = Math.hypot(m.vx, m.vy);
+        newVx = Math.cos(newAngle) * speed;
+        newVy = Math.sin(newAngle) * speed;
+      }
+      return {
+        ...m,
+        x: m.x + newVx,
+        y: m.y + newVy,
+        vx: newVx,
+        vy: newVy,
+      };
+    }).filter(m => {
+      if (m.x < -100 || m.x > W + 100 || m.y < -100 || m.y > H + 100) return false;
+      if (!G.invincible && dist(m.x, m.y, ship.x, ship.y) < 22) {
+        takeDamage(20);
+        spawnParticles(ship.x, ship.y, 10, '#ff8800');
+        return false;
+      }
+      return true;
+    });
+
+    // ── BULLET vs ENEMY SHIPS ──
+    // Both arrays are plain JS arrays in G — no React state involved
+    const usedBullets = new Set<number>();
+    for (let si = G.enemyShips.length - 1; si >= 0; si--) {
+      const ship2 = G.enemyShips[si];
+      for (let bi = G.bullets.length - 1; bi >= 0; bi--) {
+        const b = G.bullets[bi];
+        if (usedBullets.has(b.id)) continue;
+        if (dist(b.x, b.y, ship2.x, ship2.y) < 30) {
+          usedBullets.add(b.id);
+          G.enemyShips[si] = damageEnemyShip(ship2, 2);
+          if (ship2.shield > 0) {
+            spawnParticles(ship2.x, ship2.y, 4, '#66ccff');
+          }
+          if (G.enemyShips[si].hp <= 0) {
+            spawnParticles(ship2.x, ship2.y, 15, '#ff6600');
+            G.score += enemyShipReward(ship2.type);
+            if (Math.random() < enemyShipDropChance(ship2.type)) spawnPowerUp(ship2.x, ship2.y);
+            if (shouldDropOverShield(ship2.type)) spawnOverShieldPowerUp(ship2.x, ship2.y);
+            G.enemyShips.splice(si, 1);
+          }
+          break;
+        }
+      }
+    }
+    G.bullets = G.bullets.filter(b => !usedBullets.has(b.id));
+
+    // ── BULLET vs ASTEROIDS ──
+    const usedBullets2 = new Set<number>();
+    for (let ai = G.asteroids.length - 1; ai >= 0; ai--) {
+      const a = G.asteroids[ai];
+      for (let bi = G.bullets.length - 1; bi >= 0; bi--) {
+        const b = G.bullets[bi];
+        if (usedBullets2.has(b.id)) continue;
+        if (dist(b.x, b.y, a.x, a.y) < a.size) {
+          usedBullets2.add(b.id);
+          G.asteroids[ai] = { ...a, hp: a.hp - 2 };
+          if (G.asteroids[ai].hp <= 0) {
+            spawnParticles(a.x, a.y, 12, asteroidColor(a.type));
+            G.score += Math.floor(a.size * (a.type === 'armored' ? 2 : 1));
+            if (Math.random() < 0.2) spawnAsteroidPowerUp(a.x, a.y);
+            if (a.type === 'splitting') {
+              for (let k = 0; k < 3; k++) {
+                const ang = (Math.PI * 2 * k) / 3 + Math.random() * 0.5;
+                const s = 1 + Math.random() * 1.5;
+                G.asteroids.push({ id: id(), x: a.x, y: a.y, size: 20, speedX: Math.cos(ang) * s, speedY: Math.sin(ang) * s, rotation: Math.random() * 360, rotationSpeed: (Math.random() - 0.5) * 3, hp: 1, maxHp: 1, type: 'fast' });
+              }
+            }
+            G.asteroids.splice(ai, 1);
+          } else {
+            spawnParticles(a.x, a.y, 3);
+          }
+          break;
+        }
+      }
+    }
+    G.bullets = G.bullets.filter(b => !usedBullets2.has(b.id));
+
+    // ── MISSILE vs ASTEROIDS ──
+    const usedMissiles = new Set<number>();
+    for (let ai = G.asteroids.length - 1; ai >= 0; ai--) {
+      const a = G.asteroids[ai];
+      for (let mi = G.missiles.length - 1; mi >= 0; mi--) {
+        const m = G.missiles[mi];
+        if (usedMissiles.has(m.id)) continue;
+        if (dist(m.x, m.y, a.x, a.y) < a.size + 5) {
+          usedMissiles.add(m.id);
+          spawnParticles(m.x, m.y, 10, '#ffaa00');
+          G.asteroids[ai] = { ...a, hp: a.hp - 10 };
+          if (G.asteroids[ai].hp <= 0) {
+            spawnParticles(a.x, a.y, 15, asteroidColor(a.type));
+            G.score += Math.floor(a.size * (a.type === 'armored' ? 2 : 1));
+            if (Math.random() < 0.2) spawnAsteroidPowerUp(a.x, a.y);
+            G.asteroids.splice(ai, 1);
+          }
+          break;
+        }
+      }
+    }
+    G.missiles = G.missiles.filter(m => !usedMissiles.has(m.id));
+
+    // ── MISSILE vs ENEMY SHIPS ──
+    const usedMissilesOnShips = new Set<number>();
+    for (let si = G.enemyShips.length - 1; si >= 0; si--) {
+      const enemyShip = G.enemyShips[si];
+      for (let mi = G.missiles.length - 1; mi >= 0; mi--) {
+        const missile = G.missiles[mi];
+        if (usedMissilesOnShips.has(missile.id)) continue;
+        if (dist(missile.x, missile.y, enemyShip.x, enemyShip.y) < 26) {
+          usedMissilesOnShips.add(missile.id);
+          spawnParticles(missile.x, missile.y, 10, '#ffaa00');
+          G.enemyShips[si] = damageEnemyShip(enemyShip, 10);
+          if (enemyShip.shield > 0) {
+            spawnParticles(enemyShip.x, enemyShip.y, 6, '#66ccff');
+          }
+          if (G.enemyShips[si].hp <= 0) {
+            spawnParticles(enemyShip.x, enemyShip.y, 15, '#ff6600');
+            G.score += enemyShipReward(enemyShip.type);
+            if (Math.random() < enemyShipDropChance(enemyShip.type)) spawnPowerUp(enemyShip.x, enemyShip.y);
+            if (shouldDropOverShield(enemyShip.type)) spawnOverShieldPowerUp(enemyShip.x, enemyShip.y);
+            G.enemyShips.splice(si, 1);
+          }
+          break;
+        }
+      }
+    }
+    G.missiles = G.missiles.filter(m => !usedMissilesOnShips.has(m.id));
+
+    // ── BEAM vs ASTEROIDS ──
+    for (const beam of G.beams) {
+      const dx = beam.targetX - ship.x, dy = beam.targetY - ship.y;
+      const blen = Math.hypot(dx, dy);
+      if (blen === 0) continue;
+      const bw = hasPU('spread') ? 10 + ((beam.damage - 11) / 33) * 55 : 10;
+      for (let ai = G.asteroids.length - 1; ai >= 0; ai--) {
+        const a = G.asteroids[ai];
+        const ax = a.x - ship.x, ay = a.y - ship.y;
+        const proj = (ax * dx + ay * dy) / (blen ** 2);
+        if (proj < 0 || proj > 1) continue;
+        const cx = ship.x + proj * dx, cy = ship.y + proj * dy;
+        if (dist(a.x, a.y, cx, cy) < a.size + bw) {
+          G.asteroids[ai] = { ...a, hp: a.hp - beam.damage };
+          if (G.asteroids[ai].hp <= 0) {
+            spawnParticles(a.x, a.y, 12, asteroidColor(a.type));
+            G.score += Math.floor(a.size * 2 * (a.type === 'armored' ? 2 : 1));
+            if (Math.random() < 0.2) spawnAsteroidPowerUp(a.x, a.y);
+            G.asteroids.splice(ai, 1);
+          }
+        }
+      }
+
+      // Beam vs enemy ships
+      for (let si = G.enemyShips.length - 1; si >= 0; si--) {
+        const enemyShip = G.enemyShips[si];
+        const ex = enemyShip.x - ship.x;
+        const ey = enemyShip.y - ship.y;
+        const proj = (ex * dx + ey * dy) / (blen ** 2);
+        if (proj < 0 || proj > 1) continue;
+        const cx = ship.x + proj * dx;
+        const cy = ship.y + proj * dy;
+        const shipRadius = 20;
+        if (dist(enemyShip.x, enemyShip.y, cx, cy) < shipRadius + bw) {
+          G.enemyShips[si] = damageEnemyShip(enemyShip, beam.damage);
+          spawnParticles(enemyShip.x, enemyShip.y, 4, enemyShip.shield > 0 ? '#66ccff' : '#ff8844');
+          if (G.enemyShips[si].hp <= 0) {
+            spawnParticles(enemyShip.x, enemyShip.y, 15, '#ff6600');
+            G.score += enemyShipReward(enemyShip.type);
+            if (Math.random() < enemyShipDropChance(enemyShip.type)) spawnPowerUp(enemyShip.x, enemyShip.y);
+            if (shouldDropOverShield(enemyShip.type)) spawnOverShieldPowerUp(enemyShip.x, enemyShip.y);
+            G.enemyShips.splice(si, 1);
+          }
+        }
+      }
+    }
+
+    // Trigger re-render
+    setTick(t => t + 1);
+    rafRef.current = requestAnimationFrame(loop);
+  }, [takeDamage, spawnAsteroid, spawnEnemyShip, scheduleTimeout, playWaveMusicCue]);
+
+  // Input
   useEffect(() => {
-    const handleMouseMove = (e: MouseEvent) => {
-      currentMousePos.current = { x: e.clientX, y: e.clientY };
-      setMousePos({ x: e.clientX, y: e.clientY });
+    const onMove = (e: MouseEvent) => { G.mouse.x = e.clientX; G.mouse.y = e.clientY; };
+    const onDown = (e: MouseEvent) => {
+      if (!G.running) return;
+      mouseDownAt.current = Date.now();
+      setIsCharging(true);
     };
-
-    const handleKeyDown = (e: KeyboardEvent) => {
-      keysPressed.current.add(e.key.toLowerCase());
-      
-      // Ability hotkeys
+    const onUp = (e: MouseEvent) => {
+      if (!G.running) return;
+      if (mouseDownAt.current <= 0) return;
+      const hold = (Date.now() - mouseDownAt.current) / 1000;
+      const hasRapid = hasPU('rapidfire');
+      const hasSpread = hasPU('spread');
+      setIsCharging(false);
+      mouseDownAt.current = 0;
+      if (hold < 0.1) {
+        // Quick shot
+        const now = Date.now();
+        let rate = 250;
+        if (hasRapid) {
+          const rapidfirePowerUp = G.activePowerUps.find(p => p.type === 'rapidfire');
+          if (rapidfirePowerUp) {
+            rate = Math.max(10, 100 - Math.min(1, (now - rapidfirePowerUp.startTime) / 15000) * 90);
+          }
+        } else if (hasSpread) {
+          rate = 150;
+        }
+        if (now - G.lastShot < rate) return;
+        G.lastShot = now;
+        const dx = e.clientX - G.ship.x, dy = e.clientY - G.ship.y;
+        const count = hasSpread ? 3 : 1;
+        for (let i = 0; i < count; i++) {
+          const spreadOffset = hasSpread ? (i - 1) * 0.3 : 0;
+          const ang = Math.atan2(dy, dx) + spreadOffset;
+          G.bullets.push({ id: id(), x: G.ship.x, y: G.ship.y, vx: Math.cos(ang) * 6, vy: Math.sin(ang) * 6 });
+        }
+      } else {
+        // Beam
+        let dmg = Math.min(10, 2 + hold * 8);
+        if (hasRapid) {
+          dmg = Math.min(8, 2 + hold * 12);
+        } else if (hasSpread) {
+          dmg = 11 * (1 + Math.min(1, hold / 3) * 3);
+        }
+        const bid = id();
+        G.beams.push({ id: bid, targetX: e.clientX, targetY: e.clientY, damage: dmg });
+        const count = hasRapid ? 3 : 1;
+        const baseDuration = hasRapid ? 120 : 500;
+        for (let i = 0; i < count; i++) {
+          const delay = hasRapid ? baseDuration + i * 150 : baseDuration;
+          scheduleBeamRemoval(bid, delay);
+        }
+      }
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      keys.current.add(e.key.toLowerCase());
       if (e.key.toLowerCase() === 'e') {
-        activateTimeSlow();
+        const now = Date.now();
+        if (now > G.timeSlowCooldown) {
+          G.timeSlow = true;
+          G.timeSlowCooldown = now + 10000;
+          scheduleTimeout(() => { G.timeSlow = false; }, 3500);
+        }
       }
       if (e.key.toLowerCase() === 'q') {
-        activateMissileBarrage();
-      }
-    };
-
-    const handleKeyUp = (e: KeyboardEvent) => {
-      keysPressed.current.delete(e.key.toLowerCase());
-    };
-
-    window.addEventListener('mousemove', handleMouseMove);
-    window.addEventListener('mousedown', handleMouseDown);
-    window.addEventListener('mouseup', handleMouseUp);
-    window.addEventListener('keydown', handleKeyDown);
-    window.addEventListener('keyup', handleKeyUp);
-
-    return () => {
-      window.removeEventListener('mousemove', handleMouseMove);
-      window.removeEventListener('mousedown', handleMouseDown);
-      window.removeEventListener('mouseup', handleMouseUp);
-      window.removeEventListener('keydown', handleKeyDown);
-      window.removeEventListener('keyup', handleKeyUp);
-    };
-  }, [handleMouseDown, handleMouseUp, isCharging, activateTimeSlow, activateMissileBarrage]);
-
-  // Spawn asteroids periodically
-  useEffect(() => {
-    if (gameOver || !gameStarted) return;
-
-    const interval = setInterval(() => {
-      spawnAsteroid();
-    }, 3000);
-
-    for (let i = 0; i < 3; i++) {
-      setTimeout(() => spawnAsteroid(), i * 800);
-    }
-
-    return () => clearInterval(interval);
-  }, [gameOver, gameStarted, spawnAsteroid]);
-
-  // Game loop
-  useEffect(() => {
-    if (gameOver || !gameStarted) return;
-
-    const gameLoop = () => {
-      // Update ship position based on keyboard input
-      setShipVelocity(prev => {
-        let newVelX = prev.x;
-        let newVelY = prev.y;
-        const acceleration = 0.3;
-        const maxSpeed = 3;
-        const friction = 0.92;
-
-        if (keysPressed.current.has('w') || keysPressed.current.has('arrowup')) {
-          newVelY -= acceleration;
-        }
-        if (keysPressed.current.has('s') || keysPressed.current.has('arrowdown')) {
-          newVelY += acceleration;
-        }
-        if (keysPressed.current.has('a') || keysPressed.current.has('arrowleft')) {
-          newVelX -= acceleration;
-        }
-        if (keysPressed.current.has('d') || keysPressed.current.has('arrowright')) {
-          newVelX += acceleration;
-        }
-
-        newVelX *= friction;
-        newVelY *= friction;
-
-        const speed = Math.sqrt(newVelX * newVelX + newVelY * newVelY);
-        if (speed > maxSpeed) {
-          newVelX = (newVelX / speed) * maxSpeed;
-          newVelY = (newVelY / speed) * maxSpeed;
-        }
-
-        return { x: newVelX, y: newVelY };
-      });
-
-      setShipPos(prev => {
-        const newX = Math.max(30, Math.min(window.innerWidth - 30, prev.x + shipVelocity.x));
-        const newY = Math.max(30, Math.min(window.innerHeight - 30, prev.y + shipVelocity.y));
-        return { x: newX, y: newY };
-      });
-
-      // Update power-ups
-      setPowerUps(prev => {
-        const updated = prev.map(powerUp => ({
-          ...powerUp,
-          y: powerUp.y + powerUp.speedY
-        })).filter(powerUp => powerUp.y < window.innerHeight + 50);
-
-        // Check collision with ship
-        const remaining = updated.filter(powerUp => {
-          const dx = powerUp.x - shipPos.x;
-          const dy = powerUp.y - shipPos.y;
-          const distance = Math.sqrt(dx * dx + dy * dy);
-          
-          if (distance < 30) {
-            // Collect power-up
-            let duration = 10000; // 10 seconds default
-            
-            // Different durations for different power-ups
-            if (powerUp.type === 'rapidfire') {
-              duration = 30000; // 30 seconds
-            } else if (powerUp.type === 'spread') {
-              duration = 30000; // 30 seconds
-            }
-            
-            if (powerUp.type === 'health') {
-              setLives(l => Math.min(5, l + 1));
-            } else if (powerUp.type === 'shield') {
-              setShields(s => Math.min(5, s + 1));
-            } else {
-              // If picking up rapidfire or spread, remove the other one
-              if (powerUp.type === 'rapidfire' || powerUp.type === 'spread') {
-                setActivePowerUps(prev => [
-                  ...prev.filter(p => p.type !== 'rapidfire' && p.type !== 'spread'),
-                  { type: powerUp.type, endTime: Date.now() + duration, startTime: Date.now() }
-                ]);
-              } else {
-                setActivePowerUps(prev => [
-                  ...prev.filter(p => p.type !== powerUp.type),
-                  { type: powerUp.type, endTime: Date.now() + duration, startTime: Date.now() }
-                ]);
-              }
-            }
-            
-            spawnParticles(powerUp.x, powerUp.y, 12, getPowerUpColor(powerUp.type));
-            return false;
-          }
-          return true;
-        });
-
-        return remaining;
-      });
-
-      // Clean up expired power-ups
-      setActivePowerUps(prev => prev.filter(p => Date.now() < p.endTime));
-
-      // Update asteroids
-      setAsteroids(prev => {
-        // Time slow modifier
-        const timeSlowMod = timeSlowActive ? 0.3 : 1.0; // 30% speed when slow is active
-        
-        const updated = prev.map(asteroid => ({
-          ...asteroid,
-          x: asteroid.x + (asteroid.speedX * timeSlowMod),
-          y: asteroid.y + (asteroid.speedY * timeSlowMod),
-          rotation: asteroid.rotation + asteroid.rotationSpeed
-        })).filter(asteroid => {
-          return asteroid.x > -100 && asteroid.x < window.innerWidth + 100 &&
-                 asteroid.y > -100 && asteroid.y < window.innerHeight + 100;
-        });
-
-        // Check collision with ship
-        const hasShield = shields > 0;
-        const isInvulnerable = invincible || hasShield;
-        
-        if (!invincible) {
-          const currentTime = Date.now();
-          const cooldownPeriod = 2000;
-          
-          const remainingAsteroids = updated.filter(asteroid => {
-            const dx = asteroid.x - shipPos.x;
-            const dy = asteroid.y - shipPos.y;
-            const distance = Math.sqrt(dx * dx + dy * dy);
-            
-            if (distance < asteroid.size + 20) {
-              if (currentTime - lastCollisionTime.current >= cooldownPeriod) {
-                lastCollisionTime.current = currentTime;
-                
-                // Consume shield first, then life
-                if (shields > 0) {
-                  setShields(s => s - 1);
-                } else {
-                  setLives(l => {
-                    const newLives = l - 1;
-                    if (newLives <= 0) {
-                      setGameOver(true);
-                    }
-                    return newLives;
-                  });
-                }
-                
-                setInvincible(true);
-                setTimeout(() => setInvincible(false), cooldownPeriod);
-                
-                spawnParticles(asteroid.x, asteroid.y, 12);
-              }
-              return false;
-            }
-            return true;
-          });
-          
-          updateLockedTarget(remainingAsteroids);
-          return remainingAsteroids;
-        } else {
-          updateLockedTarget(updated);
-          return updated;
-        }
-      });
-
-      // Update bullets
-      setBullets(prev => 
-        prev.map(bullet => ({
-          ...bullet,
-          x: bullet.x + bullet.velocityX,
-          y: bullet.y + bullet.velocityY
-        })).filter(bullet => 
-          bullet.x > 0 && bullet.x < window.innerWidth &&
-          bullet.y > 0 && bullet.y < window.innerHeight
-        )
-      );
-
-      // Update missiles with homing behavior and acceleration
-      setMissiles(prev => {
-        const asteroidList = asteroids;
         const now = Date.now();
-        
-        return prev.map(missile => {
-          // Calculate acceleration progress (0 to 1 over 1 second)
-          const timeAlive = (now - missile.spawnTime) / 1000; // seconds
-          const accelerationDuration = 1.0; // 1 second to reach max speed
-          const accelerationProgress = Math.min(1, timeAlive / accelerationDuration);
-          
-          // Find target asteroid
-          const target = asteroidList.find(a => a.id === missile.targetId);
-          
-          if (target) {
-            // Homing logic - slower for better visual tracking
-            const dx = target.x - missile.x;
-            const dy = target.y - missile.y;
-            const distance = Math.sqrt(dx * dx + dy * dy);
-            
-            const maxSpeed = 3.4; // Maximum speed
-            const currentSpeed = maxSpeed * accelerationProgress; // Accelerate from 0 to 3.4
-            const turnRate = 0.15; // Gradual turning
-            
-            // Calculate target angle
-            const targetAngle = Math.atan2(dy, dx);
-            
-            // Calculate current angle
-            const currentAngle = Math.atan2(missile.velocityY, missile.velocityX);
-            
-            // Smoothly interpolate angle (only if missile is moving)
-            let newAngle = targetAngle;
-            if (accelerationProgress > 0.1) {
-              let angleDiff = targetAngle - currentAngle;
-              // Normalize angle difference to -PI to PI
-              while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
-              while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
-              
-              newAngle = currentAngle + angleDiff * turnRate;
-            }
-            
-            const newVelX = Math.cos(newAngle) * currentSpeed;
-            const newVelY = Math.sin(newAngle) * currentSpeed;
-            
-            return {
-              ...missile,
-              x: missile.x + newVelX,
-              y: missile.y + newVelY,
-              velocityX: newVelX,
-              velocityY: newVelY
-            };
+        if (now > G.missileCooldown) {
+          G.missileCooldown = now + 5000;
+          const shipTargets = [...G.enemyShips].sort(() => Math.random() - 0.5).slice(0, 2);
+          const asteroidTargets = [...G.asteroids].sort(() => Math.random() - 0.5).slice(0, 3);
+          const targets: Array<{ id: number; type: Missile['targetType'] }> = [];
+          shipTargets.forEach(t => targets.push({ id: t.id, type: 'ship' }));
+          asteroidTargets.forEach(t => targets.push({ id: t.id, type: 'asteroid' }));
+          targets.sort(() => Math.random() - 0.5);
+          for (let i = 0; i < targets.length; i++) {
+            scheduleMissileLaunchToTarget(targets[i].id, targets[i].type, i * 100);
           }
-          
-          // Target destroyed, keep moving straight with current velocity
-          return {
-            ...missile,
-            x: missile.x + missile.velocityX,
-            y: missile.y + missile.velocityY
-          };
-        }).filter(missile => 
-          missile.x > -50 && missile.x < window.innerWidth + 50 &&
-          missile.y > -50 && missile.y < window.innerHeight + 50
-        );
-      });
-
-      // Update particles
-      setParticles(prev => 
-        prev.map(particle => ({
-          ...particle,
-          x: particle.x + particle.velocityX,
-          y: particle.y + particle.velocityY,
-          life: particle.life - 0.02,
-          velocityX: particle.velocityX * 0.98,
-          velocityY: particle.velocityY * 0.98
-        })).filter(particle => particle.life > 0)
-      );
-
-      // Check bullet-asteroid collisions
-      setBullets(prevBullets => {
-        const remainingBullets = [...prevBullets];
-        
-        setAsteroids(prevAsteroids => {
-          let updatedAsteroids = [...prevAsteroids];
-          
-          for (let i = remainingBullets.length - 1; i >= 0; i--) {
-            const bullet = remainingBullets[i];
-            
-            for (let j = updatedAsteroids.length - 1; j >= 0; j--) {
-              const asteroid = updatedAsteroids[j];
-              const dx = bullet.x - asteroid.x;
-              const dy = bullet.y - asteroid.y;
-              const distance = Math.sqrt(dx * dx + dy * dy);
-              
-              if (distance < asteroid.size) {
-                asteroid.hp -= 2;
-                
-                if (asteroid.hp <= 0) {
-                  // Asteroid destroyed
-                  const particleColor = getAsteroidColor(asteroid.type);
-                  spawnParticles(asteroid.x, asteroid.y, 12, particleColor);
-                  setScore(s => s + Math.floor(asteroid.size * (asteroid.type === 'armored' ? 2 : 1)));
-                  
-                  // Clear locked target if this asteroid was locked
-                  if (lockedTargetRef.current && lockedTargetRef.current.id === asteroid.id) {
-                    lockedTargetRef.current = null;
-                    setLockedTarget(null);
-                  }
-                  
-                  // 20% chance to drop power-up
-                  if (Math.random() < 0.2) {
-                    spawnPowerUp(asteroid.x, asteroid.y);
-                  }
-                  
-                  // Splitting asteroids create smaller ones
-                  if (asteroid.type === 'splitting') {
-                    spawnSplitAsteroids(asteroid.x, asteroid.y);
-                  }
-                  
-                  updatedAsteroids.splice(j, 1);
-                } else {
-                  spawnParticles(asteroid.x, asteroid.y, 3);
-                }
-                
-                remainingBullets.splice(i, 1);
-                break;
-              }
-            }
-          }
-          
-          return updatedAsteroids;
-        });
-        
-        return remainingBullets;
-      });
-
-      // Check missile-asteroid collisions
-      setMissiles(prevMissiles => {
-        const remainingMissiles = [...prevMissiles];
-        
-        setAsteroids(prevAsteroids => {
-          let updatedAsteroids = [...prevAsteroids];
-          
-          for (let i = remainingMissiles.length - 1; i >= 0; i--) {
-            const missile = remainingMissiles[i];
-            
-            for (let j = updatedAsteroids.length - 1; j >= 0; j--) {
-              const asteroid = updatedAsteroids[j];
-              const dx = missile.x - asteroid.x;
-              const dy = missile.y - asteroid.y;
-              const distance = Math.sqrt(dx * dx + dy * dy);
-              
-              if (distance < asteroid.size + 5) {
-                // Missile hit - deal 10 damage
-                asteroid.hp -= 10;
-                
-                if (asteroid.hp <= 0) {
-                  const particleColor = getAsteroidColor(asteroid.type);
-                  spawnParticles(asteroid.x, asteroid.y, 15, particleColor);
-                  setScore(s => s + Math.floor(asteroid.size * (asteroid.type === 'armored' ? 2 : 1)));
-                  
-                  // Clear locked target if this asteroid was locked
-                  if (lockedTargetRef.current && lockedTargetRef.current.id === asteroid.id) {
-                    lockedTargetRef.current = null;
-                    setLockedTarget(null);
-                  }
-                  
-                  if (Math.random() < 0.2) {
-                    spawnPowerUp(asteroid.x, asteroid.y);
-                  }
-                  
-                  if (asteroid.type === 'splitting') {
-                    spawnSplitAsteroids(asteroid.x, asteroid.y);
-                  }
-                  
-                  updatedAsteroids.splice(j, 1);
-                } else {
-                  spawnParticles(asteroid.x, asteroid.y, 5);
-                }
-                
-                // Create explosion particles
-                spawnParticles(missile.x, missile.y, 10, '#ffaa00');
-                
-                remainingMissiles.splice(i, 1);
-                break;
-              }
-            }
-          }
-          
-          return updatedAsteroids;
-        });
-        
-        return remainingMissiles;
-      });
-
-      // Check beam-asteroid collisions for all active beams
-      beams.forEach(beam => {
-        setAsteroids(prevAsteroids => {
-          let updatedAsteroids = [...prevAsteroids];
-          
-          for (let j = updatedAsteroids.length - 1; j >= 0; j--) {
-            const asteroid = updatedAsteroids[j];
-            
-            const dx = beam.targetX - shipPos.x;
-            const dy = beam.targetY - shipPos.y;
-            const beamLength = Math.sqrt(dx * dx + dy * dy);
-            
-            if (beamLength === 0) continue;
-            
-            const ax = asteroid.x - shipPos.x;
-            const ay = asteroid.y - shipPos.y;
-            
-            const projection = (ax * dx + ay * dy) / (beamLength * beamLength);
-            
-            if (projection >= 0 && projection <= 1) {
-              const closestX = shipPos.x + projection * dx;
-              const closestY = shipPos.y + projection * dy;
-              
-              const distTx = asteroid.x - closestX;
-              const distTy = asteroid.y - closestY;
-              const distToBeam = Math.sqrt(distTx * distTx + distTy * distTy);
-              
-              // Beam width scales with damage
-              // Normal: 10px fixed
-              // Spread: 10px to 65px based on damage (11 to 44)
-              let beamWidth = 10;
-              if (hasPowerUp('spread')) {
-                // Scale from 10px (at 11 damage) to 65px (at 44 damage)
-                const damageRatio = (beam.damage - 11) / (44 - 11); // 0 to 1
-                beamWidth = 10 + (damageRatio * 55); // 10 to 65
-              }
-              
-              if (distToBeam < asteroid.size + beamWidth) {
-                asteroid.hp -= beam.damage;
-                
-                if (asteroid.hp <= 0) {
-                  const particleColor = getAsteroidColor(asteroid.type);
-                  spawnParticles(asteroid.x, asteroid.y, 12, particleColor);
-                  setScore(s => s + Math.floor(asteroid.size * 2 * (asteroid.type === 'armored' ? 2 : 1)));
-                  
-                  // Clear locked target if this asteroid was locked
-                  if (lockedTargetRef.current && lockedTargetRef.current.id === asteroid.id) {
-                    lockedTargetRef.current = null;
-                    setLockedTarget(null);
-                  }
-                  
-                  if (Math.random() < 0.2) {
-                    spawnPowerUp(asteroid.x, asteroid.y);
-                  }
-                  
-                  if (asteroid.type === 'splitting') {
-                    spawnSplitAsteroids(asteroid.x, asteroid.y);
-                  }
-                  
-                  updatedAsteroids.splice(j, 1);
-                } else {
-                  spawnParticles(asteroid.x, asteroid.y, 5);
-                }
-              }
-            }
-          }
-          
-          return updatedAsteroids;
-        });
-      });
-
-      gameLoopRef.current = requestAnimationFrame(gameLoop);
-    };
-
-    const updateLockedTarget = (asteroidList: Asteroid[]) => {
-      const cursorX = mousePos.x;
-      const cursorY = mousePos.y;
-      let closestAsteroid: Asteroid | null = null;
-      let closestDistance = Infinity;
-
-      // If we have a locked target, verify it still exists and update its reference
-      if (lockedTargetRef.current) {
-        const currentTarget = asteroidList.find(a => a.id === lockedTargetRef.current?.id);
-        if (currentTarget) {
-          // Update the locked target with current asteroid data
-          lockedTargetRef.current = currentTarget;
-          setLockedTarget(currentTarget);
-        } else {
-          // Target no longer exists, clear it
-          lockedTargetRef.current = null;
-          setLockedTarget(null);
         }
       }
+    };
+    const onKeyUp = (e: KeyboardEvent) => keys.current.delete(e.key.toLowerCase());
+    globalThis.addEventListener('mousemove', onMove);
+    globalThis.addEventListener('mousedown', onDown);
+    globalThis.addEventListener('mouseup', onUp);
+    globalThis.addEventListener('keydown', onKeyDown);
+    globalThis.addEventListener('keyup', onKeyUp);
+    return () => {
+      globalThis.removeEventListener('mousemove', onMove);
+      globalThis.removeEventListener('mousedown', onDown);
+      globalThis.removeEventListener('mouseup', onUp);
+      globalThis.removeEventListener('keydown', onKeyDown);
+      globalThis.removeEventListener('keyup', onKeyUp);
+    };
+  }, [scheduleTimeout, scheduleBeamRemoval, scheduleMissileLaunch, scheduleMissileLaunchToTarget]);
 
-      // Find closest asteroid to cursor
-      asteroidList.forEach(asteroid => {
-        const dx = asteroid.x - cursorX;
-        const dy = asteroid.y - cursorY;
-        const distance = Math.sqrt(dx * dx + dy * dy);
-        
-        if (distance < 150 && distance < closestDistance) {
-          closestDistance = distance;
-          closestAsteroid = asteroid;
+  // Spawners
+  useEffect(() => {
+    if (!gameStarted || gameOver) return;
+    const startupAsteroidTimeouts: Array<ReturnType<typeof globalThis.setTimeout>> = [];
+    const waveScheduleTimeouts: Array<ReturnType<typeof globalThis.setTimeout>> = [];
+    let cancelled = false;
+    for (let i = 0; i < 3; i++) {
+      startupAsteroidTimeouts.push(globalThis.setTimeout(() => spawnAsteroid(), i * 800));
+    }
+    const ia = setInterval(() => spawnAsteroid(), 3000);
+
+    const WAVE_INTERVAL_MS = 30000;
+    const WAVE_WARNING_MS = 3000;
+
+    const scheduleNextWave = (delayMs: number) => {
+      if (cancelled) return;
+      const nextWave = G.wave + 1;
+      const warningTimeout = globalThis.setTimeout(() => {
+        if (!cancelled && G.running) {
+          playWaveMusicCue('incoming', nextWave);
         }
-      });
+      }, Math.max(0, delayMs - WAVE_WARNING_MS));
+      waveScheduleTimeouts.push(warningTimeout);
 
-      // Only update lock if we found a new close asteroid
-      if (closestAsteroid) {
-        lockedTargetRef.current = closestAsteroid;
-        setLockedTarget(closestAsteroid);
-      } else if (!lockedTargetRef.current) {
-        // No close asteroid and no current lock
-        setLockedTarget(null);
-      }
+      const startTimeout = globalThis.setTimeout(() => {
+        if (cancelled || !G.running) return;
+        G.wave += 1;
+        playWaveMusicCue('start', G.wave);
+        spawnEnemyWave(G.wave);
+        scheduleNextWave(WAVE_INTERVAL_MS);
+      }, delayMs);
+      waveScheduleTimeouts.push(startTimeout);
     };
 
-    gameLoopRef.current = requestAnimationFrame(gameLoop);
+    scheduleNextWave(4000);
 
     return () => {
-      if (gameLoopRef.current) {
-        cancelAnimationFrame(gameLoopRef.current);
+      cancelled = true;
+      clearInterval(ia);
+      for (const timeoutId of startupAsteroidTimeouts) {
+        globalThis.clearTimeout(timeoutId);
+      }
+      for (const timeoutId of waveScheduleTimeouts) {
+        globalThis.clearTimeout(timeoutId);
       }
     };
-  }, [gameOver, gameStarted, shipPos, shipVelocity, mousePos, beams, invincible, hasPowerUp, spawnParticles, spawnPowerUp, spawnSplitAsteroids]);
+  }, [gameStarted, gameOver, spawnAsteroid, spawnEnemyWave, playWaveMusicCue]);
+
+  useEffect(() => {
+    return () => {
+      clearAllTimeouts();
+    };
+  }, [clearAllTimeouts]);
+
+  // Start loop
+  useEffect(() => {
+    if (gameStarted && !gameOver) {
+      rafRef.current = requestAnimationFrame(loop);
+    }
+    return () => cancelAnimationFrame(rafRef.current);
+  }, [gameStarted, gameOver, loop]);
 
   const startGame = () => {
-    setGameStarted(true);
+    clearAllTimeouts();
+    // Reset G
+    G.asteroids = []; G.bullets = []; G.enemyBullets = []; G.enemyShips = [];
+    G.enemyBeams = [];
+    G.particles = []; G.powerUps = []; G.activePowerUps = []; G.beams = []; G.missiles = [];
+    G.ship = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
+    G.vel = { x: 0, y: 0 };
+    G.hp = 100; G.playerShield = G.playerBaseShieldMax; G.deathsDefied = 1; G.score = 0;
+    G.invincible = false; G.deathDefied = false; G.timeSlow = false;
+    G.timeSlowCooldown = 0; G.missileCooldown = 0;
+    G.lastShot = 0; G.lastHit = 0;
+    G.lastPlayerDamageAt = Date.now();
+    G.lastShieldRegenAt = G.lastPlayerDamageAt;
+    G.wave = 0;
+    G.waveSpawnEndsAt = 0;
+    G.waveEndCuePlayed = true;
+    G.firstCaptainOverShieldDropped = false;
+    G.running = true;
+    gameOverRef.current = false;
+    keys.current.clear();
+    mouseDownAt.current = 0;
     setGameOver(false);
-    setScore(0);
-    setLives(3);
-    setShields(0);
-    setAsteroids([]);
-    setBullets([]);
-    setMissiles([]);
-    setParticles([]);
-    setPowerUps([]);
-    setActivePowerUps([]);
-    setShipPos({ x: window.innerWidth / 2, y: window.innerHeight / 2 });
-    setShipVelocity({ x: 0, y: 0 });
-    setLockedTarget(null);
-    lockedTargetRef.current = null;
-    setBeams([]);
+    setGameStarted(true);
     setIsCharging(false);
-    setInvincible(false);
-    setTimeSlowActive(false);
-    setTimeSlowEndTime(0);
-    setTimeSlowCooldown(0);
-    setMissileBarrageCooldown(0);
-    setMagnetActive(false);
-    setMagnetEndTime(0);
-    keysPressed.current.clear();
-    mouseDownTime.current = 0;
-    lastCollisionTime.current = 0;
-    lastShotTime.current = 0;
-    nextAsteroidId.current = 0;
-    nextBulletId.current = 0;
-    nextMissileId.current = 0;
-    nextParticleId.current = 0;
-    nextPowerUpId.current = 0;
-    nextBeamId.current = 0;
   };
 
   const resetGame = () => {
+    cancelAnimationFrame(rafRef.current);
+    clearAllTimeouts();
+    G.running = false;
     setGameStarted(false);
-    setScore(0);
-    setLives(3);
-    setShields(0);
     setGameOver(false);
-    setAsteroids([]);
-    setBullets([]);
-    setMissiles([]);
-    setParticles([]);
-    setPowerUps([]);
-    setActivePowerUps([]);
-    setShipPos({ x: window.innerWidth / 2, y: window.innerHeight / 2 });
-    setShipVelocity({ x: 0, y: 0 });
-    setLockedTarget(null);
-    lockedTargetRef.current = null;
-    setBeams([]);
     setIsCharging(false);
-    setInvincible(false);
-    setTimeSlowActive(false);
-    setTimeSlowEndTime(0);
-    setTimeSlowCooldown(0);
-    setMissileBarrageCooldown(0);
-    setMagnetActive(false);
-    setMagnetEndTime(0);
-    keysPressed.current.clear();
-    mouseDownTime.current = 0;
-    lastCollisionTime.current = 0;
-    lastShotTime.current = 0;
-    nextAsteroidId.current = 0;
-    nextBulletId.current = 0;
-    nextMissileId.current = 0;
-    nextParticleId.current = 0;
-    nextPowerUpId.current = 0;
-    nextBeamId.current = 0;
   };
 
-  // Helper functions
-  const getAsteroidColor = (type: Asteroid['type']) => {
-    switch(type) {
-      case 'fast': return '#00ffff';
-      case 'armored': return '#ff8800';
-      case 'splitting': return '#ff00ff';
-      default: return undefined;
-    }
-  };
+  if (!mounted) return null;
 
-  const getPowerUpColor = (type: PowerUp['type']) => {
-    switch(type) {
-      case 'shield': return '#00ccff';
-      case 'rapidfire': return '#ffff00';
-      case 'spread': return '#ff00ff';
-      case 'health': return '#00ff00';
-    }
-  };
-
-  const getPowerUpSymbol = (type: PowerUp['type']) => {
-    switch(type) {
-      case 'shield': return '🛡';
-      case 'rapidfire': return '⚡';
-      case 'spread': return '◈';
-      case 'health': return '+';
-    }
-  };
-
-  // Cheat menu toggle
-  useEffect(() => {
-    const handleCheatKey = (e: KeyboardEvent) => {
-      if (e.key.toLowerCase() === 'c') {
-        setShowCheatMenu(prev => !prev);
-      }
-    };
-    window.addEventListener('keydown', handleCheatKey);
-    return () => window.removeEventListener('keydown', handleCheatKey);
-  }, []);
-
-  // Cheat functions
-  const giveAllPowerUps = () => {
-    const now = Date.now();
-    setActivePowerUps([
-      { type: 'rapidfire', endTime: now + 30000, startTime: now },
-      { type: 'spread', endTime: now + 30000, startTime: now }
-    ]);
-    setShields(5);
-    setLives(5);
-  };
-
-  const clearAsteroids = () => {
-    setAsteroids([]);
-  };
-
-  const addScore = (amount: number) => {
-    setScore(s => s + amount);
-  };
-
-  if (!mounted) {
-    return null;
+  // Read from G for rendering (tick forces re-render each frame)
+  const ship = G.ship;
+  const mouse = G.mouse;
+  const hpDisplayColor = hpColor(G.hp, 100);
+  const gameOverMessage = scoreMessage(G.score);
+  const nowTs = Date.now();
+  const rapidActive = hasPU('rapidfire');
+  const spreadActive = hasPU('spread');
+  const deathDefiedAvailable = G.deathsDefied > 0;
+  const deathDefiedDotColor = deathDefiedAvailable ? '#FFD700' : '#333';
+  const deathDefiedDotShadow = deathDefiedAvailable ? '0 0 10px #FFD700,0 0 20px #FFA500' : 'none';
+  const deathDefiedDotBorder = deathDefiedAvailable ? '#FFD700' : '#555';
+  const shipOpacity = G.invincible ? 0.5 : 1;
+  const shipAnimation = G.invincible ? 'flash .2s infinite' : 'none';
+  const hasOverShield = G.playerShield > G.playerBaseShieldMax;
+  const shieldAuraColor = hasOverShield ? '#00ff66' : '#00ccff';
+  const shieldFillColor = shieldAuraColor;
+  let chargeColor = 'cyan';
+  let chargeDurationMs = 1000;
+  if (rapidActive) {
+    chargeColor = '#ff0';
+    chargeDurationMs = 500;
+  } else if (spreadActive) {
+    chargeColor = '#f0f';
+    chargeDurationMs = 3000;
   }
 
   return (
-    <div className="w-screen h-screen relative overflow-hidden bg-black" style={{ cursor: 'none' }}>
+    <div className="w-screen h-screen relative overflow-hidden bg-black" style={{ cursor: 'none' }} data-tick={tick}>
       <style>{`
-        @keyframes pulse {
-          0%, 100% { opacity: 1; }
-          50% { opacity: 0.5; }
-        }
-        @keyframes flash {
-          0%, 100% { opacity: 0.3; }
-          50% { opacity: 1; }
-        }
+        @keyframes pulse { 0%,100%{opacity:1}50%{opacity:0.5} }
+        @keyframes flash { 0%,100%{opacity:0.3}50%{opacity:1} }
+        @keyframes sniperFlash { 0%,100%{opacity:.2}50%{opacity:1} }
+        @keyframes ddPulse { 0%{opacity:0.5}100%{opacity:1} }
+        @keyframes ddText { 0%{opacity:0;transform:translate(-50%,-50%) scale(0.6)} 15%{opacity:1;transform:translate(-50%,-50%) scale(1.15)} 30%{transform:translate(-50%,-50%) scale(1)} 70%{opacity:1} 100%{opacity:0;transform:translate(-50%,-60%)} }
       `}</style>
-      
-      {/* Background layer */}
-      <div className="absolute top-0 left-0 w-full h-full z-0">
-        <PixelSnow 
-          color="#ffffff"
-          flakeSize={0.01}
-          minFlakeSize={1.25}
-          pixelResolution={200}
-          speed={1.25}
-          depthFade={8}
-          farPlane={20}
-          brightness={0.7}
-          gamma={0.4545}
-          density={0.3}
-          variant="snowflake"
-          direction={125}
-        />
+
+      <div className="absolute inset-0 z-0">
+        <PixelSnow color="#ffffff" flakeSize={0.01} minFlakeSize={1.25} pixelResolution={200} speed={1.25} depthFade={8} farPlane={20} brightness={0.7} gamma={0.4545} density={0.3} variant="snowflake" direction={125} />
       </div>
 
-      {/* Time Slow Effect */}
-      {timeSlowActive && (
+      {/* Death Defied effect */}
+      {G.deathDefied && (
         <>
-          {/* Grayscale filter overlay */}
-          <div 
-            className="absolute top-0 left-0 w-full h-full z-50 pointer-events-none"
-            style={{
-              mixBlendMode: 'saturation',
-              backgroundColor: 'rgba(128, 128, 128, 0.8)',
-              animation: 'flash 0.5s ease-in-out'
-            }}
-          />
-          
-          {/* Subtle radial effect */}
-          <svg className="absolute top-0 left-0 w-full h-full z-50 pointer-events-none" style={{ opacity: 0.3 }}>
-            {/* Radial lines emanating from center */}
-            {Array.from({ length: 12 }).map((_, i) => {
-              const angle = (i * 30) * (Math.PI / 180);
-              const length = Math.max(window.innerWidth, window.innerHeight);
-              const centerX = window.innerWidth / 2;
-              const centerY = window.innerHeight / 2;
-              const endX = centerX + Math.cos(angle) * length;
-              const endY = centerY + Math.sin(angle) * length;
-              
-              return (
-                <line
-                  key={i}
-                  x1={centerX}
-                  y1={centerY}
-                  x2={endX}
-                  y2={endY}
-                  stroke="rgba(200, 200, 200, 0.3)"
-                  strokeWidth="1"
-                  style={{
-                    animation: 'flash 0.3s ease-out',
-                    filter: 'blur(2px)'
-                  }}
-                />
-              );
+          <div className="absolute inset-0 z-50 pointer-events-none" style={{ background: 'radial-gradient(ellipse at center,rgba(255,215,0,.45) 0%,rgba(255,165,0,.2) 40%,transparent 70%)', animation: 'ddPulse .6s ease-out infinite alternate' }} />
+          <div className="absolute inset-0 z-50 pointer-events-none" style={{ boxShadow: 'inset 0 0 120px 40px rgba(255,200,0,.35)' }} />
+          <div className="absolute top-1/2 left-1/2 z-50 pointer-events-none" style={{ animation: 'ddText 3s ease-out forwards' }}>
+            <div style={{ fontFamily: 'monospace', fontSize: 52, fontWeight: 'bold', color: '#FFD700', textShadow: '0 0 30px #FFD700,0 0 60px #FFA500,0 0 100px #FF8C00', letterSpacing: 6, whiteSpace: 'nowrap' }}>DEATH DEFIED</div>
+          </div>
+        </>
+      )}
+
+      {/* Time slow effect */}
+      {G.timeSlow && (
+        <>
+          <div className="absolute inset-0 z-40 pointer-events-none" style={{ mixBlendMode: 'saturation', backgroundColor: 'rgba(128,128,128,.8)', animation: 'flash .5s ease-in-out' }} />
+          <svg className="absolute inset-0 z-40 w-full h-full pointer-events-none" style={{ opacity: .3 }}>
+            {TIME_SLOW_ANGLES.map((angleDeg) => {
+              const a = angleDeg * Math.PI / 180;
+              const len = Math.max(window.innerWidth, window.innerHeight);
+              return <line key={angleDeg} x1={window.innerWidth/2} y1={window.innerHeight/2} x2={window.innerWidth/2+Math.cos(a)*len} y2={window.innerHeight/2+Math.sin(a)*len} stroke="rgba(200,200,200,.3)" strokeWidth="1" style={{ filter: 'blur(2px)' }} />;
             })}
           </svg>
         </>
       )}
 
-      {/* Game UI */}
+      {/* HUD */}
       {gameStarted && !gameOver && (
         <>
-          <div className="absolute top-5 left-5 z-10 text-white font-mono text-xl" style={{ textShadow: '2px 2px 4px rgba(0,0,0,0.8)' }}>
-            <div>Score: {score}</div>
-            <div>Lives: {lives}</div>
-            {shields > 0 && (
-              <div style={{ color: '#00ccff' }}>Shields: {shields}</div>
-            )}
-          </div>
-
-          {/* Active Power-ups Display */}
-          <div className="absolute top-5 right-5 z-10 text-white font-mono text-sm" style={{ textShadow: '2px 2px 4px rgba(0,0,0,0.8)' }}>
-            {activePowerUps.filter(p => p.type !== 'shield').map((powerUp, i) => {
-              const timeLeft = Math.ceil((powerUp.endTime - Date.now()) / 1000);
-              return (
-                <div key={i} style={{ 
-                  color: getPowerUpColor(powerUp.type as PowerUp['type']),
-                  marginBottom: '5px'
-                }}>
-                  {powerUp.type.toUpperCase()}: {timeLeft}s
-                </div>
-              );
-            })}
-          </div>
-
-          {/* Ability Cooldowns */}
-          <div className="absolute top-5 right-5 z-10 text-white font-mono text-sm mt-32" style={{ textShadow: '2px 2px 4px rgba(0,0,0,0.8)' }}>
-            <div className="mb-2">
-              <div className="flex items-center gap-2">
-                <span style={{ color: '#00ffff' }}>E - Time Slow:</span>
-                {Date.now() < timeSlowCooldown ? (
-                  <span style={{ color: '#ff6666' }}>{Math.ceil((timeSlowCooldown - Date.now()) / 1000)}s</span>
-                ) : (
-                  <span style={{ color: '#00ff00' }}>READY</span>
-                )}
-              </div>
-              {timeSlowActive && <span style={{ color: '#ffff00' }}>ACTIVE!</span>}
+          <div className="absolute top-5 left-5 z-10 font-mono text-white" style={{ textShadow: '2px 2px 4px rgba(0,0,0,.8)' }}>
+            <div className="text-xl">Score: {G.score}</div>
+            <div className="mt-1 flex items-center gap-2">
+              <span className="text-sm" style={{ color: '#888' }}>DEATH DEFIED</span>
+              <div style={{ width: 18, height: 18, borderRadius: '50%', backgroundColor: deathDefiedDotColor, boxShadow: deathDefiedDotShadow, border: `2px solid ${deathDefiedDotBorder}`, transition: 'all .3s' }} />
             </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <span style={{ color: '#ff8800' }}>Q - Missiles:</span>
-                {Date.now() < missileBarrageCooldown ? (
-                  <span style={{ color: '#ff6666' }}>{Math.ceil((missileBarrageCooldown - Date.now()) / 1000)}s</span>
-                ) : (
-                  <span style={{ color: '#00ff00' }}>READY</span>
-                )}
+            <div className="mt-2">
+              <div className="text-sm mb-1" style={{ color: hpDisplayColor }}>HP: {G.hp}/100</div>
+              <div style={{ width: 180, height: 8, background: '#333', borderRadius: 4, border: '1px solid #666' }}>
+                <div style={{ width: `${G.hp}%`, height: '100%', borderRadius: 4, backgroundColor: hpDisplayColor, transition: 'width .2s,background-color .3s', boxShadow: `0 0 6px ${hpDisplayColor}` }} />
+              </div>
+            </div>
+            <div className="mt-2">
+              <div className="text-sm mb-1" style={{ color: shieldFillColor }}>SHIELD: {Math.ceil(G.playerShield)}/{G.playerBaseShieldMax + G.playerOverShieldMax}</div>
+              <div style={{ width: 180, height: 6, background: '#223', borderRadius: 4, border: '1px solid #355' }}>
+                <div style={{ width: `${(G.playerShield / (G.playerBaseShieldMax + G.playerOverShieldMax)) * 100}%`, height: '100%', borderRadius: 4, backgroundColor: shieldFillColor, transition: 'width .2s,background-color .3s', boxShadow: `0 0 6px ${shieldFillColor}` }} />
               </div>
             </div>
           </div>
 
-          {/* Controls */}
-          <div className="absolute bottom-5 left-5 z-10 text-white font-mono text-sm opacity-70" style={{ textShadow: '2px 2px 4px rgba(0,0,0,0.8)' }}>
-            <div>WASD / Arrow Keys: Move</div>
-            <div>Mouse: Aim</div>
-            <div style={{ color: '#ffff00' }}>Click: Shoot (2 dmg)</div>
-            <div style={{ color: '#00ffff' }}>Hold: Beam (2-10 dmg)</div>
-            {hasPowerUp('rapidfire') && (
-              <div style={{ color: '#ffff00', marginTop: '5px' }}>RAPID FIRE: Fast shots + 3x yellow beam!</div>
-            )}
-            {hasPowerUp('spread') && (
-              <div style={{ color: '#ff00ff', marginTop: '5px' }}>SPREAD: 3 bullets + wide beam (11-44 dmg)!</div>
-            )}
-            <div className="mt-2" style={{ color: '#ffaa00' }}>
-              <div>Orange Line: Lead Target</div>
-              <div>Red Line: Direct Line</div>
+          <div className="absolute top-5 right-5 z-10 font-mono text-sm text-white" style={{ textShadow: '2px 2px 4px rgba(0,0,0,.8)' }}>
+            {G.activePowerUps.filter(p => p.type !== 'shield' && p.type !== 'overshield').map((p) => (
+              <div key={`${p.type}-${p.endTime}`} style={{ color: puColor(p.type), marginBottom: 5 }}>{p.type.toUpperCase()}: {Math.ceil((p.endTime - nowTs) / 1000)}s</div>
+            ))}
+          </div>
+
+          <div className="absolute z-10 font-mono text-sm text-white" style={{ top: 130, right: 20, textShadow: '2px 2px 4px rgba(0,0,0,.8)' }}>
+            <div className="mb-2 flex gap-2 items-center">
+              <span style={{ color: '#0ff' }}>E - Time Slow:</span>
+              {nowTs < G.timeSlowCooldown ? <span style={{ color: '#f66' }}>{Math.ceil((G.timeSlowCooldown - nowTs) / 1000)}s</span> : <span style={{ color: '#0f0' }}>READY</span>}
+            </div>
+            <div className="flex gap-2 items-center">
+              <span style={{ color: '#f80' }}>Q - Missiles:</span>
+              {nowTs < G.missileCooldown ? <span style={{ color: '#f66' }}>{Math.ceil((G.missileCooldown - nowTs) / 1000)}s</span> : <span style={{ color: '#0f0' }}>READY</span>}
             </div>
           </div>
 
-          {/* Locked Target Indicator */}
-          {lockedTarget && (
-            <div className="absolute top-5 right-5 z-10 text-red-500 font-mono" 
-                 style={{ 
-                   textShadow: '2px 2px 4px rgba(0,0,0,0.8)',
-                   animation: 'pulse 1s infinite',
-                   marginTop: activePowerUps.filter(p => p.type !== 'shield').length * 25 + 'px'
-                 }}>
-              TARGET LOCKED
-            </div>
-          )}
+          <div className="absolute bottom-5 left-5 z-10 font-mono text-sm text-white opacity-70">
+            <div>WASD / Arrows: Move</div>
+            <div style={{ color: '#ff0' }}>Click: Shoot &nbsp; <span style={{ color: '#0ff' }}>Hold: Beam</span></div>
+            <div className="mt-1" style={{ color: '#f44' }}>Watch out for enemy ships!</div>
+          </div>
         </>
       )}
 
-      {/* Start Screen */}
+      {/* Start screen */}
       {!gameStarted && !gameOver && (
-        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-20 text-center text-white font-mono cursor-default">
-          <h1 className="text-6xl mb-5" style={{ 
-            textShadow: '0 0 20px cyan, 0 0 40px cyan',
-            letterSpacing: '5px'
-          }}>
-            ASTEROID DEFENDER
-          </h1>
-          <div className="text-lg mb-10 text-gray-400 leading-relaxed">
-            <p>WASD / Arrow Keys to Move</p>
-            <p>Mouse to Aim</p>
-            <p style={{ color: '#ffff00' }}>Click to Shoot (2 damage)</p>
-            <p style={{ color: '#00ffff' }}>Hold to Charge Beam (2-10 damage)</p>
-            <p className="mt-5" style={{ color: '#ffaa00' }}>
-              Lock onto asteroids for guided targeting
-            </p>
-            <p style={{ color: '#ff6666', fontSize: '14px', marginTop: '10px' }}>
-              Watch out for different asteroid types!
-            </p>
-            <p style={{ color: '#00ff00', fontSize: '14px', marginTop: '10px' }}>
-              Power-ups replace beam with special abilities!
-            </p>
+        <div className="absolute inset-0 z-20 flex flex-col items-center justify-center text-white font-mono text-center cursor-default">
+          <h1 className="text-6xl mb-5" style={{ textShadow: '0 0 20px cyan,0 0 40px cyan', letterSpacing: 5 }}>ASTEROID DEFENDER</h1>
+          <div className="text-lg mb-10 text-gray-400 leading-loose">
+            <p>WASD / Arrows to move &nbsp;|&nbsp; Mouse to aim</p>
+            <p><span style={{ color: '#ff0' }}>Click: shoot</span> &nbsp;|&nbsp; <span style={{ color: '#0ff' }}>Hold: beam</span></p>
+            <p className="mt-3" style={{ color: '#f44' }}>Enemy ships hunt and shoot you!</p>
+            <p className="mt-1" style={{ color: '#FFD700', fontSize: 14 }}>1× Death Defied — survive your first death!</p>
           </div>
-          <button
-            onClick={startGame}
-            className="px-12 py-5 text-2xl cursor-pointer bg-cyan-400 text-black border-none rounded-lg font-mono font-bold transition-all duration-300"
-            style={{ boxShadow: '0 0 20px cyan' }}
-            onMouseEnter={(e) => {
-              e.currentTarget.style.transform = 'scale(1.1)';
-              e.currentTarget.style.boxShadow = '0 0 30px cyan';
-            }}
-            onMouseLeave={(e) => {
-              e.currentTarget.style.transform = 'scale(1)';
-              e.currentTarget.style.boxShadow = '0 0 20px cyan';
-            }}
-          >
+          <button onClick={startGame} className="px-12 py-5 text-2xl bg-cyan-400 text-black rounded-lg font-bold cursor-pointer" style={{ boxShadow: '0 0 20px cyan' }}
+            onMouseEnter={e => e.currentTarget.style.transform = 'scale(1.1)'}
+            onMouseLeave={e => e.currentTarget.style.transform = 'scale(1)'}>
             START GAME
           </button>
-          <div className="mt-10 text-sm text-gray-600">
-            Survive as long as you can and rack up the highest score!
-          </div>
         </div>
       )}
 
-      {/* Game Over Screen */}
+      {/* Game over */}
       {gameOver && (
-        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-20 text-center text-white font-mono cursor-default">
-          <h1 className="text-6xl mb-5 text-red-500" style={{ 
-            textShadow: '0 0 20px #ff4444, 0 0 40px #ff4444'
-          }}>
-            GAME OVER
-          </h1>
-          <p className="text-3xl mb-2 text-cyan-400" style={{ textShadow: '0 0 10px cyan' }}>
-            Final Score: {score}
-          </p>
-          <p className="text-lg mb-10 text-gray-400">
-            {score > 500 ? 'Excellent!' : score > 300 ? 'Great job!' : score > 100 ? 'Good try!' : 'Keep practicing!'}
-          </p>
-          <button
-            onClick={resetGame}
-            className="px-12 py-5 text-2xl cursor-pointer bg-white text-black border-none rounded-lg font-mono font-bold transition-all duration-300"
-            style={{ boxShadow: '0 0 20px white' }}
-            onMouseEnter={(e) => {
-              e.currentTarget.style.transform = 'scale(1.1)';
-              e.currentTarget.style.backgroundColor = 'cyan';
-            }}
-            onMouseLeave={(e) => {
-              e.currentTarget.style.transform = 'scale(1)';
-              e.currentTarget.style.backgroundColor = 'white';
-            }}
-          >
+        <div className="absolute inset-0 z-20 flex flex-col items-center justify-center text-white font-mono text-center cursor-default">
+          <h1 className="text-6xl mb-5 text-red-500" style={{ textShadow: '0 0 20px #f44,0 0 40px #f44' }}>GAME OVER</h1>
+          <p className="text-3xl mb-2 text-cyan-400" style={{ textShadow: '0 0 10px cyan' }}>Score: {G.score}</p>
+          <p className="text-lg mb-10 text-gray-400">{gameOverMessage}</p>
+          <button onClick={resetGame} className="px-12 py-5 text-2xl bg-white text-black rounded-lg font-bold cursor-pointer" style={{ boxShadow: '0 0 20px white' }}
+            onMouseEnter={e => { e.currentTarget.style.backgroundColor = 'cyan'; }}
+            onMouseLeave={e => { e.currentTarget.style.backgroundColor = 'white'; }}>
             PLAY AGAIN
           </button>
         </div>
       )}
 
-      {/* Cheat Menu */}
-      {showCheatMenu && (
-        <div className="absolute top-5 right-5 z-30 bg-black bg-opacity-90 border-2 border-cyan-400 rounded-lg p-4 text-white font-mono text-sm cursor-default">
-          <div className="text-cyan-400 font-bold mb-3 text-center">CHEAT MENU</div>
-          <div className="space-y-2">
-            <button
-              onClick={() => { setLives(l => Math.min(5, l + 1)); }}
-              className="w-full px-3 py-1 bg-green-600 hover:bg-green-700 rounded transition-colors cursor-pointer"
-            >
-              + Life
-            </button>
-            <button
-              onClick={() => { setShields(s => Math.min(5, s + 1)); }}
-              className="w-full px-3 py-1 bg-blue-600 hover:bg-blue-700 rounded transition-colors cursor-pointer"
-            >
-              + Shield
-            </button>
-            
-            <div className="text-cyan-400 text-xs mt-2 mb-1">Power-ups:</div>
-            
-            <button
-              onClick={() => {
-                const now = Date.now();
-                setActivePowerUps(prev => [
-                  ...prev.filter(p => p.type !== 'rapidfire'),
-                  { type: 'rapidfire', endTime: now + 30000, startTime: now }
-                ]);
-              }}
-              className="w-full px-3 py-1 bg-yellow-600 hover:bg-yellow-700 rounded transition-colors cursor-pointer"
-            >
-              Rapid Fire
-            </button>
-            
-            <button
-              onClick={() => {
-                const now = Date.now();
-                setActivePowerUps(prev => [
-                  ...prev.filter(p => p.type !== 'spread'),
-                  { type: 'spread', endTime: now + 30000, startTime: now }
-                ]);
-              }}
-              className="w-full px-3 py-1 bg-purple-600 hover:bg-purple-700 rounded transition-colors cursor-pointer"
-            >
-              Spread Shot
-            </button>
-            
-            <div className="text-cyan-400 text-xs mt-2 mb-1">Game:</div>
-            
-            <button
-              onClick={clearAsteroids}
-              className="w-full px-3 py-1 bg-red-600 hover:bg-red-700 rounded transition-colors cursor-pointer"
-            >
-              Clear Asteroids
-            </button>
-            <button
-              onClick={() => addScore(1000)}
-              className="w-full px-3 py-1 bg-yellow-700 hover:bg-yellow-800 rounded transition-colors cursor-pointer"
-            >
-              +1000 Score
-            </button>
-            <button
-              onClick={() => setInvincible(!invincible)}
-              className="w-full px-3 py-1 bg-orange-600 hover:bg-orange-700 rounded transition-colors cursor-pointer"
-            >
-              {invincible ? 'Invincible: ON' : 'Invincible: OFF'}
-            </button>
-          </div>
-          <div className="text-gray-400 text-xs mt-3 text-center">Press C to close</div>
-        </div>
-      )}
-
-      {/* Game Objects Layer */}
+      {/* Game objects */}
       {gameStarted && !gameOver && (
-        <div className="absolute top-0 left-0 w-full h-full z-[1] pointer-events-none">
+        <div className="absolute inset-0 z-[1] pointer-events-none">
           {/* Ship */}
-          <div
-            className="absolute transition-transform duration-100 ease-out"
-            style={{
-              left: shipPos.x,
-              top: shipPos.y,
-              transform: `translate(-50%, -50%) rotate(${Math.atan2(
-                mousePos.y - shipPos.y,
-                mousePos.x - shipPos.x
-              )}rad)`,
-              opacity: invincible ? 0.5 : 1,
-              animation: invincible ? 'flash 0.2s infinite' : 'none'
-            }}
-          >
+          <div className="absolute" style={{ left: ship.x, top: ship.y, transform: `translate(-50%,-50%) rotate(${Math.atan2(mouse.y - ship.y, mouse.x - ship.x)}rad)`, opacity: shipOpacity, animation: shipAnimation }}>
             <svg width="40" height="40" viewBox="0 0 40 40">
-              <polygon
-                points="30,20 10,10 10,30"
-                fill="white"
-                stroke={invincible ? "#ff4444" : shields > 0 ? "#00ccff" : "cyan"}
-                strokeWidth="2"
-              />
-              {shields > 0 && (
-                <circle cx="20" cy="20" r="18" fill="none" stroke="#00ccff" strokeWidth="2" opacity="0.5">
-                  <animate attributeName="r" values="18;22;18" dur="1s" repeatCount="indefinite" />
-                </circle>
-              )}
+              {G.playerShield > 0 && <circle cx="20" cy="20" r="17" fill="none" stroke={shieldAuraColor} strokeWidth="2" opacity="0.75" />}
+              <polygon points="30,20 10,10 10,30" fill="white" stroke={G.invincible ? '#f44' : 'cyan'} strokeWidth="2" />
             </svg>
-            {invincible && (
-              <div className="absolute -top-8 left-1/2 -translate-x-1/2 text-red-500 text-xs font-mono font-bold whitespace-nowrap"
-                   style={{ textShadow: '0 0 5px #ff4444' }}>
-                INVINCIBLE
-              </div>
-            )}
           </div>
+
+          {/* Enemy ships */}
+          {G.enemyShips.map(s => (
+            <div key={s.id} className="absolute" style={{ left: s.x, top: s.y, transform: `translate(-50%,-50%) rotate(${s.rotation}deg)` }}>
+              <svg width="36" height="36" viewBox="0 0 36 36">
+                {s.type === 'sniper' ? (
+                  <>
+                    <polygon points="18,1 30,24 24,30 12,30 6,24" fill="rgba(120,0,120,.9)" stroke="#ff66ff" strokeWidth="2" />
+                    <line x1="18" y1="1" x2="18" y2="-7" stroke="#ff66ff" strokeWidth="2" />
+                    {s.charging && <circle cx="18" cy="18" r="4" fill="#ffd1f0" opacity="0.9" />}
+                    {s.charging && s.chargeUntil > nowTs && s.chargeUntil - nowTs <= 500 && (
+                      <circle cx="18" cy="18" r="15" fill="none" stroke="#ff88ff" strokeWidth="2" style={{ animation: 'sniperFlash .2s linear infinite' }} />
+                    )}
+                  </>
+                ) : s.type === 'captain' ? (
+                  <>
+                    <polygon points="18,2 31,10 31,26 18,34 5,26 5,10" fill="rgba(30,110,200,.85)" stroke="#7dd3fc" strokeWidth="2" />
+                    <line x1="18" y1="2" x2="18" y2="-6" stroke="#7dd3fc" strokeWidth="2" />
+                    {s.shield > 0 && <circle cx="18" cy="18" r="15" fill="none" stroke="#67e8f9" strokeWidth="2" opacity="0.8" />}
+                  </>
+                ) : s.type === 'aggressive' ? (
+                  <>
+                    <polygon points="18,2 34,30 2,30" fill="rgba(255,120,30,.9)" stroke="#ff9933" strokeWidth="2" />
+                    <line x1="18" y1="2" x2="18" y2="-6" stroke="#ffcc66" strokeWidth="2" />
+                  </>
+                ) : s.type === 'grenadier' ? (
+                  <>
+                    <polygon points="18,4 28,12 28,24 18,32 8,24 8,12" fill="rgba(100,150,50,.9)" stroke="#88cc44" strokeWidth="2" />
+                    <line x1="18" y1="4" x2="18" y2="-5" stroke="#88cc44" strokeWidth="2" />
+                    <circle cx="18" cy="18" r="3" fill="#ddff88" opacity="0.7" />
+                  </>
+                ) : (
+                  <polygon points="18,2 34,34 18,26 2,34" fill="rgba(180,0,0,.85)" stroke="#f44" strokeWidth="2" />
+                )}
+              </svg>
+              <div style={{ position: 'absolute', bottom: -8, left: '50%', transform: 'translateX(-50%)', width: 36, height: 3, background: '#333', borderRadius: 2 }}>
+                <div style={{ width: `${s.hp / s.maxHp * 100}%`, height: '100%', background: s.type === 'sniper' ? '#f6f' : s.type === 'captain' ? '#7dd3fc' : s.type === 'aggressive' ? '#ff9933' : s.type === 'grenadier' ? '#88cc44' : '#f44', borderRadius: 2 }} />
+              </div>
+              {s.maxShield > 0 && (
+                <div style={{ position: 'absolute', bottom: -13, left: '50%', transform: 'translateX(-50%)', width: 36, height: 2, background: '#223', borderRadius: 2 }}>
+                  <div style={{ width: `${(s.shield / s.maxShield) * 100}%`, height: '100%', background: '#67e8f9', borderRadius: 2 }} />
+                </div>
+              )}
+              <div style={{ position: 'absolute', top: -14, left: '50%', transform: 'translateX(-50%)', fontSize: 9, fontFamily: 'monospace', color: s.type === 'captain' ? '#7dd3fc' : s.type === 'aggressive' ? '#ffb366' : s.type === 'sniper' ? '#ff88ff' : s.type === 'grenadier' ? '#99dd55' : '#ff6666' }}>
+                {s.type.toUpperCase()}
+              </div>
+            </div>
+          ))}
+
+          {/* Enemy beams */}
+          <svg className="absolute inset-0 w-full h-full pointer-events-none">
+            {G.enemyBeams.map(beam => (
+              <g key={beam.id}>
+                <line x1={beam.x1} y1={beam.y1} x2={beam.x2} y2={beam.y2} stroke={beam.type === 'telegraph' ? '#ff66ff' : '#ff1177'} strokeWidth={beam.type === 'telegraph' ? 3 : 6} opacity={beam.type === 'telegraph' ? '.45' : '.35'} strokeDasharray={beam.type === 'telegraph' ? '8,6' : undefined} strokeLinecap="round" />
+                <line x1={beam.x1} y1={beam.y1} x2={beam.x2} y2={beam.y2} stroke={beam.type === 'telegraph' ? '#ffe6ff' : '#ffd1f0'} strokeWidth={beam.type === 'telegraph' ? 1.5 : 2} opacity={beam.type === 'telegraph' ? '.65' : '.85'} strokeLinecap="round" />
+              </g>
+            ))}
+          </svg>
+
+          {/* Enemy bullets */}
+          {G.enemyBullets.map(b => (
+            <div key={b.id} className="absolute w-1.5 h-1.5 rounded-full" style={{ left: b.x, top: b.y, transform: 'translate(-50%,-50%)', backgroundColor: b.color || '#f44', boxShadow: `0 0 6px ${b.color || '#f44'}` }} />
+          ))}
+
+          {/* Enemy missiles */}
+          {G.enemyMissiles.map(m => (
+            <div key={m.id} className="absolute w-3 h-4 rounded" style={{ left: m.x, top: m.y, transform: 'translate(-50%,-50%)', background: 'linear-gradient(to bottom, #88cc44, #ddff88)', boxShadow: '0 0 8px rgba(136,204,68,.9)' }} />
+          ))}
 
           {/* Asteroids */}
-          {asteroids.map(asteroid => {
-            const asteroidColor = asteroid.type === 'fast' ? '#00ffff' :
-                                 asteroid.type === 'armored' ? '#ff8800' :
-                                 asteroid.type === 'splitting' ? '#ff00ff' :
-                                 'white';
-            
+          {G.asteroids.map(a => {
+            const col = asteroidStrokeColor(a.type);
+            const asteroidHpColor = hpColor(a.hp, a.maxHp);
             return (
-              <div
-                key={asteroid.id}
-                className="cursor-target absolute pointer-events-auto"
-                style={{
-                  left: asteroid.x,
-                  top: asteroid.y,
-                  width: asteroid.size * 2,
-                  height: asteroid.size * 2,
-                  transform: `translate(-50%, -50%) rotate(${asteroid.rotation}deg)`
-                }}
-              >
-                <svg width={asteroid.size * 2} height={asteroid.size * 2} viewBox="0 0 100 100">
-                  <polygon
-                    points="50,5 80,25 85,60 60,90 30,85 10,60 15,25"
-                    fill="rgba(100, 100, 100, 0.8)"
-                    stroke={asteroidColor}
-                    strokeWidth={asteroid.type === 'armored' ? '4' : '2'}
-                  />
+              <div key={a.id} className="asteroid-target absolute pointer-events-auto" style={{ left: a.x, top: a.y, width: a.size * 2, height: a.size * 2, transform: `translate(-50%,-50%) rotate(${a.rotation}deg)` }}>
+                <svg width={a.size * 2} height={a.size * 2} viewBox="0 0 100 100">
+                  <polygon points="50,5 80,25 85,60 60,90 30,85 10,60 15,25" fill="rgba(100,100,100,.8)" stroke={col} strokeWidth={a.type === 'armored' ? 4 : 2} />
                 </svg>
-                
-                {/* HP Bar */}
-                <div className="absolute -bottom-2 left-1/2 -translate-x-1/2 h-1 bg-red-900 bg-opacity-30 border border-white border-opacity-50 rounded overflow-hidden"
-                     style={{
-                       width: asteroid.size * 1.5,
-                       transform: `translateX(-50%) rotate(${-asteroid.rotation}deg)`
-                     }}>
-                  <div className="h-full transition-all duration-200"
-                       style={{
-                         width: `${(asteroid.hp / asteroid.maxHp) * 100}%`,
-                         backgroundColor: asteroid.hp > asteroid.maxHp * 0.5 ? '#00ff00' : 
-                                        asteroid.hp > asteroid.maxHp * 0.25 ? '#ffff00' : '#ff0000'
-                       }} />
+                <div className="absolute -bottom-2 left-1/2 h-1 rounded overflow-hidden" style={{ width: a.size * 1.5, transform: `translateX(-50%) rotate(${-a.rotation}deg)`, background: 'rgba(150,0,0,.3)', border: '1px solid rgba(255,255,255,.5)' }}>
+                  <div style={{ width: `${a.hp / a.maxHp * 100}%`, height: '100%', backgroundColor: asteroidHpColor }} />
                 </div>
               </div>
             );
           })}
 
           {/* Power-ups */}
-          {powerUps.map(powerUp => (
-            <div
-              key={powerUp.id}
-              className="absolute"
-              style={{
-                left: powerUp.x,
-                top: powerUp.y,
-                transform: 'translate(-50%, -50%)'
-              }}
-            >
-              <div className="relative w-8 h-8 rounded border-2 flex items-center justify-center text-xl font-bold"
-                   style={{
-                     borderColor: getPowerUpColor(powerUp.type),
-                     backgroundColor: `${getPowerUpColor(powerUp.type)}33`,
-                     color: getPowerUpColor(powerUp.type),
-                     boxShadow: `0 0 10px ${getPowerUpColor(powerUp.type)}`
-                   }}>
-                {getPowerUpSymbol(powerUp.type)}
-              </div>
+          {G.powerUps.map(p => (
+            <div key={p.id} className="absolute w-8 h-8 rounded border-2 flex items-center justify-center text-xl font-bold" style={{ left: p.x, top: p.y, transform: 'translate(-50%,-50%)', borderColor: puColor(p.type), backgroundColor: puColor(p.type) + '33', color: puColor(p.type), boxShadow: `0 0 10px ${puColor(p.type)}` }}>
+              {powerUpIcon(p.type)}
             </div>
           ))}
 
           {/* Bullets */}
-          {bullets.map(bullet => (
-            <div
-              key={bullet.id}
-              className="absolute w-1.5 h-1.5 rounded-full bg-yellow-400"
-              style={{
-                left: bullet.x,
-                top: bullet.y,
-                transform: 'translate(-50%, -50%)',
-                boxShadow: '0 0 10px yellow'
-              }}
-            />
+          {G.bullets.map(b => (
+            <div key={b.id} className="absolute w-1.5 h-1.5 rounded-full bg-yellow-400" style={{ left: b.x, top: b.y, transform: 'translate(-50%,-50%)', boxShadow: '0 0 10px yellow' }} />
           ))}
 
           {/* Missiles */}
-          {missiles.map(missile => (
-            <div
-              key={missile.id}
-              className="absolute"
-              style={{
-                left: missile.x,
-                top: missile.y,
-                transform: 'translate(-50%, -50%)'
-              }}
-            >
-              <div className="w-2 h-3 bg-gradient-to-b from-orange-500 to-red-600 rounded-full"
-                   style={{
-                     boxShadow: '0 0 8px rgba(255, 100, 0, 0.8)',
-                     filter: 'brightness(1.2)'
-                   }}>
-                <div className="w-0.5 h-0.5 rounded-full bg-yellow-300 absolute top-0.5 left-0.5"
-                     style={{ boxShadow: '0 0 3px yellow' }} />
-              </div>
-            </div>
+          {G.missiles.map(m => (
+            <div key={m.id} className="absolute w-2 h-3 rounded-full bg-gradient-to-b from-orange-500 to-red-600" style={{ left: m.x, top: m.y, transform: 'translate(-50%,-50%)', boxShadow: '0 0 8px rgba(255,100,0,.8)' }} />
           ))}
 
           {/* Particles */}
-          {particles.map(particle => (
-            <div
-              key={particle.id}
-              className="absolute rounded-full"
-              style={{
-                left: particle.x,
-                top: particle.y,
-                width: particle.size,
-                height: particle.size,
-                backgroundColor: particle.color || `rgba(255, ${255 * particle.life}, 0, ${particle.life})`,
-                transform: 'translate(-50%, -50%)',
-                boxShadow: `0 0 ${particle.size * 2}px ${particle.color || `rgba(255, ${255 * particle.life}, 0, ${particle.life})`}`
-              }}
-            />
-          ))}
+          {G.particles.map(p => {
+            const particleColor = p.color || `rgba(255,${Math.floor(255 * p.life)},0,${p.life})`;
+            return (
+              <div key={p.id} className="absolute rounded-full" style={{ left: p.x, top: p.y, width: p.size, height: p.size, transform: 'translate(-50%,-50%)', backgroundColor: particleColor, boxShadow: `0 0 ${p.size * 2}px ${particleColor}` }} />
+            );
+          })}
 
-          {/* Beam Weapons */}
-          {(beams.length > 0 || isCharging) && (
-            <svg className="absolute top-0 left-0 w-full h-full pointer-events-none">
-              {/* Render all active beams */}
-              {beams.map(beam => {
-                // Calculate width based on damage for spread shot
-                let outerWidth, innerWidth;
-                
-                if (hasPowerUp('spread')) {
-                  // Scale from narrow (at 11 dmg) to wide (at 44 dmg)
-                  const damageRatio = Math.min(1, (beam.damage - 11) / (44 - 11));
-                  outerWidth = 10 + (damageRatio * 55); // 10 to 65
-                  innerWidth = 5 + (damageRatio * 27.5); // 5 to 32.5
-                } else if (hasPowerUp('rapidfire')) {
-                  outerWidth = Math.min(20, 5 + beam.damage * 1.5);
-                  innerWidth = Math.min(10, 2 + beam.damage * 0.8);
-                } else {
-                  // Normal beam
-                  outerWidth = Math.min(20, 5 + beam.damage * 1.5);
-                  innerWidth = Math.min(10, 2 + beam.damage * 0.8);
+          {/* Beams */}
+          {(G.beams.length > 0 || isCharging) && (
+            <svg className="absolute inset-0 w-full h-full pointer-events-none">
+              <defs><filter id="glow"><feGaussianBlur stdDeviation="3" result="cb"/><feMerge><feMergeNode in="cb"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>
+              {G.beams.map(beam => {
+                const rp = hasPU('rapidfire'), sp = hasPU('spread');
+                const ow = sp ? 10 + ((beam.damage-11)/33)*55 : Math.min(20, 5+beam.damage*1.5);
+                const iw = sp ? 5 + ((beam.damage-11)/33)*27 : Math.min(10, 2+beam.damage*.8);
+                let beamColor = 'cyan';
+                if (rp) {
+                  beamColor = '#ff0';
+                } else if (sp) {
+                  beamColor = '#f0f';
                 }
-                
                 return (
                   <g key={beam.id}>
-                    <line
-                      x1={shipPos.x}
-                      y1={shipPos.y}
-                      x2={beam.targetX}
-                      y2={beam.targetY}
-                      stroke={hasPowerUp('rapidfire') ? '#ffff00' : hasPowerUp('spread') ? '#ff00ff' : 'cyan'}
-                      strokeWidth={outerWidth}
-                      opacity="0.8"
-                      strokeLinecap="round"
-                      filter="url(#glow)"
-                    />
-                    <line
-                      x1={shipPos.x}
-                      y1={shipPos.y}
-                      x2={beam.targetX}
-                      y2={beam.targetY}
-                      stroke="white"
-                      strokeWidth={innerWidth}
-                      opacity="1"
-                      strokeLinecap="round"
-                    />
+                    <line x1={ship.x} y1={ship.y} x2={beam.targetX} y2={beam.targetY} stroke={beamColor} strokeWidth={ow} opacity=".8" strokeLinecap="round" filter="url(#glow)" />
+                    <line x1={ship.x} y1={ship.y} x2={beam.targetX} y2={beam.targetY} stroke="white" strokeWidth={iw} strokeLinecap="round" />
                   </g>
                 );
               })}
-              
-              {/* Charging indicator */}
               {isCharging && (
-                <line
-                  x1={shipPos.x}
-                  y1={shipPos.y}
-                  x2={mousePos.x}
-                  y2={mousePos.y}
-                  stroke={hasPowerUp('rapidfire') ? '#ffff00' : hasPowerUp('spread') ? '#ff00ff' : '#00ffff'}
-                  strokeWidth="2"
-                  opacity="0.5"
-                  strokeDasharray="5,5"
-                >
-                  <animate
-                    attributeName="stroke-dashoffset"
-                    values="0;10"
-                    dur="0.3s"
-                    repeatCount="indefinite"
-                  />
+                <line x1={ship.x} y1={ship.y} x2={mouse.x} y2={mouse.y} stroke={chargeColor} strokeWidth="2" opacity=".5" strokeDasharray="5,5">
+                  <animate attributeName="stroke-dashoffset" values="0;10" dur=".3s" repeatCount="indefinite" />
                 </line>
               )}
-              
-              <defs>
-                <filter id="glow">
-                  <feGaussianBlur stdDeviation="3" result="coloredBlur"/>
-                  <feMerge>
-                    <feMergeNode in="coloredBlur"/>
-                    <feMergeNode in="SourceGraphic"/>
-                  </feMerge>
-                </filter>
-              </defs>
             </svg>
           )}
 
-          {/* Debug Info */}
-          {hasPowerUp('spread') && (
-            <div className="absolute top-20 left-5 z-10 text-white font-mono text-xs bg-black bg-opacity-50 p-2 rounded">
-              Last beam damage: {beams.length > 0 ? beams[beams.length - 1].damage.toFixed(1) : 'N/A'}
-            </div>
-          )}
-
-          {/* Charge Indicator */}
+          {/* Charge bar */}
           {isCharging && (
-            <div className="absolute pointer-events-none"
-                 style={{
-                   left: shipPos.x,
-                   top: shipPos.y - 40,
-                   transform: 'translateX(-50%)'
-                 }}>
-              <div className="w-15 h-2 bg-black bg-opacity-50 rounded overflow-hidden"
-                   style={{
-                     border: `1px solid ${hasPowerUp('rapidfire') ? '#ffff00' : hasPowerUp('spread') ? '#ff00ff' : 'cyan'}`
-                   }}>
-                <div className="h-full transition-all duration-50"
-                     style={{
-                       width: `${Math.min(100, ((Date.now() - mouseDownTime.current) / (hasPowerUp('rapidfire') ? 500 : hasPowerUp('spread') ? 3000 : 1000)) * 100)}%`,
-                       backgroundColor: hasPowerUp('rapidfire') ? '#ffff00' : hasPowerUp('spread') ? '#ff00ff' : 'cyan',
-                       boxShadow: `0 0 10px ${hasPowerUp('rapidfire') ? '#ffff00' : hasPowerUp('spread') ? '#ff00ff' : 'cyan'}`
-                     }} />
+            <div className="absolute pointer-events-none" style={{ left: ship.x, top: ship.y - 42, transform: 'translateX(-50%)' }}>
+              <div style={{ width: 60, height: 6, background: '#333', borderRadius: 3, border: `1px solid ${chargeColor}` }}>
+                <div style={{ width: `${Math.min(100, ((Date.now() - mouseDownAt.current) / chargeDurationMs) * 100)}%`, height:'100%', borderRadius:3, backgroundColor: chargeColor }} />
               </div>
             </div>
           )}
         </div>
       )}
 
-      {/* Crosshair and Cursor */}
+      {/* Crosshair */}
       <div className="relative z-[2] w-full h-full pointer-events-none">
         {gameStarted && <Crosshair color="cyan" />}
-        {gameStarted && <TargetCursor targetSelector=".cursor-target" spinDuration={0.5} />}
-        
-        {/* Target Lock Indicator */}
-        {lockedTarget && gameStarted && (
-          <>
-            <svg className="absolute top-0 left-0 w-full h-full pointer-events-none">
-              <line
-                x1={shipPos.x}
-                y1={shipPos.y}
-                x2={lockedTarget.x}
-                y2={lockedTarget.y}
-                stroke="#ff4444"
-                strokeWidth="2"
-                strokeDasharray="10,5"
-                opacity="0.4"
-              />
-              
-              <line
-                x1={shipPos.x}
-                y1={shipPos.y}
-                x2={lockedTarget.x + lockedTarget.speedX * 30}
-                y2={lockedTarget.y + lockedTarget.speedY * 30}
-                stroke="#ffaa00"
-                strokeWidth="2"
-                strokeDasharray="5,5"
-                opacity="0.6"
-              >
-                <animate
-                  attributeName="stroke-dashoffset"
-                  values="0;10"
-                  dur="0.5s"
-                  repeatCount="indefinite"
-                />
-              </line>
-              
-              <circle
-                cx={lockedTarget.x + lockedTarget.speedX * 30}
-                cy={lockedTarget.y + lockedTarget.speedY * 30}
-                r="8"
-                fill="none"
-                stroke="#ffaa00"
-                strokeWidth="2"
-                opacity="0.8"
-              >
-                <animate
-                  attributeName="r"
-                  values="6;10;6"
-                  dur="1s"
-                  repeatCount="indefinite"
-                />
-              </circle>
-            </svg>
-            
-            <div className="absolute pointer-events-none"
-                 style={{
-                   left: lockedTarget.x,
-                   top: lockedTarget.y,
-                   transform: 'translate(-50%, -50%)'
-                 }}>
-              <svg width="80" height="80" viewBox="0 0 80 80" style={{ filter: 'drop-shadow(0 0 5px #ff4444)' }}>
-                <circle
-                  cx="40"
-                  cy="40"
-                  r="35"
-                  fill="none"
-                  stroke="#ff4444"
-                  strokeWidth="2"
-                  strokeDasharray="5,5"
-                  opacity="0.8"
-                >
-                  <animateTransform
-                    attributeName="transform"
-                    type="rotate"
-                    from="0 40 40"
-                    to="360 40 40"
-                    dur="2s"
-                    repeatCount="indefinite"
-                  />
-                </circle>
-                
-                <path d="M 15 15 L 15 25 M 15 15 L 25 15" stroke="#ff4444" strokeWidth="3" opacity="0.9" />
-                <path d="M 65 15 L 65 25 M 65 15 L 55 15" stroke="#ff4444" strokeWidth="3" opacity="0.9" />
-                <path d="M 15 65 L 15 55 M 15 65 L 25 65" stroke="#ff4444" strokeWidth="3" opacity="0.9" />
-                <path d="M 65 65 L 65 55 M 65 65 L 55 65" stroke="#ff4444" strokeWidth="3" opacity="0.9" />
-                
-                <circle cx="40" cy="40" r="3" fill="#ff4444" opacity="0.8">
-                  <animate
-                    attributeName="opacity"
-                    values="0.4;1;0.4"
-                    dur="1s"
-                    repeatCount="indefinite"
-                  />
-                </circle>
-              </svg>
-            </div>
-          </>
-        )}
+        {gameStarted && <TargetCursor targetSelector=".asteroid-target" spinDuration={0.5} />}
       </div>
     </div>
   );

@@ -84,6 +84,10 @@ const TargetCursor: React.FC<TargetCursorProps> = ({
     createSpinTimeline();
 
     const tickerFn = () => {
+      if (activeTarget && !(activeTarget as Node).isConnected) {
+        currentLeaveHandler?.();
+        return;
+      }
       if (!targetCornerPositionsRef.current || !cursorRef.current || !cornersRef.current) {
         return;
       }
