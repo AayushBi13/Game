@@ -11,15 +11,20 @@ interface Asteroid {
 }
 interface Bullet { id: number; x: number; y: number; vx: number; vy: number; }
 interface EnemyBullet { id: number; x: number; y: number; vx: number; vy: number; damage: number; color?: string; }
-interface EnemyShip { id: number; x: number; y: number; hp: number; maxHp: number; shield: number; maxShield: number; vx: number; vy: number; rotation: number; lastShot: number; type: 'fighter' | 'sniper' | 'captain' | 'aggressive' | 'grenadier'; charging: boolean; chargeUntil: number; freezeLeadMs: number; aimX: number; aimY: number; shotX: number; shotY: number; }
-interface EnemyBeam { id: number; x1: number; y1: number; x2: number; y2: number; expiresAt: number; type: 'telegraph' | 'sniper'; }
+interface EnemyShip { id: number; x: number; y: number; hp: number; maxHp: number; shield: number; maxShield: number; vx: number; vy: number; rotation: number; lastShot: number; type: 'fighter' | 'sniper' | 'captain' | 'aggressive' | 'grenadier' | 'tank'; charging: boolean; chargeUntil: number; freezeLeadMs: number; aimX: number; aimY: number; shotX: number; shotY: number; }
+interface EnemyBeam { id: number; x1: number; y1: number; x2: number; y2: number; expiresAt: number; type: 'telegraph' | 'sniper'; sourceShipId?: number; }
 interface EnemyMissile { id: number; x: number; y: number; vx: number; vy: number; born: number; trackUntil: number; }
 interface Particle { id: number; x: number; y: number; vx: number; vy: number; life: number; size: number; color?: string; }
 interface PowerUp { id: number; x: number; y: number; type: 'shield' | 'rapidfire' | 'spread' | 'health' | 'overshield'; }
 interface ActivePowerUp { type: PowerUp['type']; endTime: number; startTime: number; }
-interface Beam { id: number; targetX: number; targetY: number; damage: number; }
+interface Beam { id: number; targetX: number; targetY: number; damage: number; hitAsteroidIds: number[]; hitShipIds: number[]; }
 interface Missile { id: number; x: number; y: number; vx: number; vy: number; targetId: number; targetType: 'asteroid' | 'ship'; born: number; }
 interface AsteroidSpec { type: Asteroid['type']; size: number; hp: number; speedMul: number; }
+
+const DIFFICULTY_SCALER = 1;
+const ENEMY_DAMAGE_MULTIPLIER = 1 + 0.25 * DIFFICULTY_SCALER;
+const ENEMY_HP_MULTIPLIER = 1 + 0.05 * DIFFICULTY_SCALER;
+const SNIPER_PREDICTION_FRAMES = 14;
 
 // ── All mutable game state lives here, outside React ──
 const G = {
@@ -79,6 +84,7 @@ function pointToSegmentDistance(px: number, py: number, x1: number, y1: number, 
 }
 
 function enemyShipReward(type: EnemyShip['type']) {
+  if (type === 'tank') return 700;
   if (type === 'captain') return 240;
   if (type === 'sniper') return 180;
   if (type === 'grenadier') return 170;
@@ -87,6 +93,7 @@ function enemyShipReward(type: EnemyShip['type']) {
 }
 
 function enemyShipDropChance(type: EnemyShip['type']) {
+  if (type === 'tank') return 0.55;
   if (type === 'captain') return 0.4;
   if (type === 'grenadier') return 0.26;
   if (type === 'aggressive') return 0.22;
@@ -190,15 +197,15 @@ function normalAsteroidHp(size: number) {
 function asteroidSpecFromRoll(r: number): AsteroidSpec {
   if (r < 0.6) {
     const size = 30 + Math.random() * 40;
-    return { type: 'normal', size, hp: normalAsteroidHp(size), speedMul: 1 };
+    return { type: 'normal', size, hp: Math.max(1, Math.round(normalAsteroidHp(size) * ENEMY_HP_MULTIPLIER)), speedMul: 1 };
   }
   if (r < 0.8) {
-    return { type: 'fast', size: 20 + Math.random() * 20, hp: 2, speedMul: 2 };
+    return { type: 'fast', size: 20 + Math.random() * 20, hp: Math.max(1, Math.round(2 * ENEMY_HP_MULTIPLIER)), speedMul: 2 };
   }
   if (r < 0.95) {
-    return { type: 'armored', size: 60 + Math.random() * 20, hp: 15, speedMul: 0.5 };
+    return { type: 'armored', size: 60 + Math.random() * 20, hp: Math.max(1, Math.round(15 * ENEMY_HP_MULTIPLIER)), speedMul: 0.5 };
   }
-  return { type: 'splitting', size: 40 + Math.random() * 20, hp: 4, speedMul: 1 };
+  return { type: 'splitting', size: 40 + Math.random() * 20, hp: Math.max(1, Math.round(4 * ENEMY_HP_MULTIPLIER)), speedMul: 1 };
 }
 
 const TIME_SLOW_ANGLES = [0, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330];
@@ -328,8 +335,11 @@ export default function AsteroidShooter() {
     else if (shipType === 'captain') { hp = 14; shield = 20; }
     else if (shipType === 'grenadier') hp = 9;
     else if (shipType === 'aggressive') hp = 6;
+    else if (shipType === 'tank') { hp = 500; shield = 250; }
 
-    hp = Math.round(hp * 1.3);
+    if (shipType !== 'tank') {
+      hp = Math.max(1, Math.round(hp * 1.3 * ENEMY_HP_MULTIPLIER));
+    }
 
     G.enemyShips.push({ id: id(), x, y, hp, maxHp: hp, shield, maxShield: shield, vx: 0, vy: 0, rotation: 0, lastShot: Date.now(), type: shipType, charging: false, chargeUntil: 0, freezeLeadMs: 0, aimX: 0, aimY: 0, shotX: 0, shotY: 0 });
   }, []);
@@ -340,43 +350,57 @@ export default function AsteroidShooter() {
     let aggressiveCount: number;
     let captainCount: number;
     let grenadierCount: number;
+    let tankCount: number;
 
-    if (waveNumber === 1) {
+    if (waveNumber % 10 === 0) {
+      fighterCount = 4;
+      sniperCount = 0;
+      aggressiveCount = 0;
+      captainCount = 0;
+      grenadierCount = 2;
+      tankCount = 1;
+    } else if (waveNumber === 1) {
       fighterCount = 3;
       sniperCount = 1;
       aggressiveCount = 0;
       captainCount = 0;
       grenadierCount = 0;
+      tankCount = 0;
     } else if (waveNumber === 2) {
       fighterCount = 4;
       sniperCount = 1;
       aggressiveCount = 0;
       captainCount = 0;
       grenadierCount = 0;
+      tankCount = 0;
     } else if (waveNumber === 3) {
       fighterCount = 5;
       sniperCount = 1;
       aggressiveCount = 0;
       captainCount = 0;
       grenadierCount = 0;
+      tankCount = 0;
     } else if (waveNumber === 4) {
       fighterCount = 6;
       sniperCount = 1;
       aggressiveCount = 1;
       captainCount = 0;
       grenadierCount = 1;
+      tankCount = 0;
     } else if (waveNumber === 5) {
       fighterCount = 6;
       sniperCount = 2;
       aggressiveCount = 1;
       captainCount = 1;
       grenadierCount = 1;
+      tankCount = 0;
     } else if (waveNumber === 6) {
       fighterCount = 6;
       sniperCount = 2;
       aggressiveCount = 2;
       captainCount = 1;
       grenadierCount = 1;
+      tankCount = 0;
     } else {
       const rampLevel = 1 + Math.floor((waveNumber - 7) / 3.5);
       fighterCount = 6;
@@ -384,6 +408,7 @@ export default function AsteroidShooter() {
       aggressiveCount = Math.min(2, 1 + Math.floor(rampLevel / 2));
       captainCount = Math.min(2, 1 + Math.floor(rampLevel / 2));
       grenadierCount = Math.min(2, 1 + Math.floor(rampLevel / 2.5));
+      tankCount = 0;
     }
 
     const waveShips: EnemyShip['type'][] = [];
@@ -392,6 +417,7 @@ export default function AsteroidShooter() {
     for (let i = 0; i < aggressiveCount; i++) waveShips.push('aggressive');
     for (let i = 0; i < captainCount; i++) waveShips.push('captain');
     for (let i = 0; i < grenadierCount; i++) waveShips.push('grenadier');
+    for (let i = 0; i < tankCount; i++) waveShips.push('tank');
 
     for (let i = waveShips.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
@@ -440,10 +466,10 @@ export default function AsteroidShooter() {
     ship.y = Math.max(30, Math.min(H - 30, ship.y + G.vel.y));
 
     // Player shield recharge (base shield only)
-    if (now - G.lastPlayerDamageAt >= 4000 && G.playerShield < G.playerBaseShieldMax) {
+    if (now - G.lastPlayerDamageAt >= 2000 && G.playerShield < G.playerBaseShieldMax) {
       const elapsedSeconds = (now - G.lastShieldRegenAt) / 1000;
       if (elapsedSeconds > 0) {
-        G.playerShield = Math.min(G.playerBaseShieldMax, G.playerShield + elapsedSeconds * 3);
+        G.playerShield = Math.min(G.playerBaseShieldMax, G.playerShield + elapsedSeconds * 5);
         G.lastShieldRegenAt = now;
       }
     } else {
@@ -481,7 +507,7 @@ export default function AsteroidShooter() {
       if (!G.invincible && dist(a.x, a.y, ship.x, ship.y) < a.size + 20) {
         if (now - G.lastHit > 2000) {
           G.lastHit = now;
-          takeDamage(20);
+          takeDamage(Math.max(1, Math.round(20 * ENEMY_DAMAGE_MULTIPLIER)));
           spawnParticles(a.x, a.y, 12);
           if (!G.invincible) { G.invincible = true; scheduleTimeout(() => { G.invincible = false; }, 2000); }
         }
@@ -556,6 +582,7 @@ export default function AsteroidShooter() {
       const isCaptain = s.type === 'captain';
       const isAggressive = s.type === 'aggressive';
       const isGrenadier = s.type === 'grenadier';
+      const isTank = s.type === 'tank';
       let target = 300;
       let maxSpd = 1.2;
       let accelToward = 0.1;
@@ -580,6 +607,11 @@ export default function AsteroidShooter() {
         maxSpd = 1;
         accelToward = 0.09;
         accelAway = 0.09;
+      } else if (isTank) {
+        target = 420;
+        maxSpd = 0.42;
+        accelToward = 0.04;
+        accelAway = 0.04;
       }
       let vx = s.vx, vy = s.vy;
       if (d > 0) {
@@ -599,17 +631,33 @@ export default function AsteroidShooter() {
           vx = 0;
           vy = 0;
         }
+        if (s.charging && now < s.chargeUntil) {
+          const telegraphIndex = G.enemyBeams.findIndex(beam => beam.type === 'telegraph' && beam.sourceShipId === s.id);
+          if (telegraphIndex >= 0) {
+            G.enemyBeams[telegraphIndex] = {
+              ...G.enemyBeams[telegraphIndex],
+              x1: s.x,
+              y1: s.y,
+              x2: ship.x,
+              y2: ship.y,
+            };
+          }
+        }
         if (s.charging && now >= s.chargeUntil) {
-          G.enemyBeams.push({ id: id(), x1: s.shotX, y1: s.shotY, x2: s.aimX, y2: s.aimY, expiresAt: now + 180, type: 'sniper' });
-          if (pointToSegmentDistance(ship.x, ship.y, s.shotX, s.shotY, s.aimX, s.aimY) < 26) {
-            takeDamage(30);
+          const shotX = s.x;
+          const shotY = s.y;
+          const aimX = Math.max(0, Math.min(W, ship.x + G.vel.x * SNIPER_PREDICTION_FRAMES));
+          const aimY = Math.max(0, Math.min(H, ship.y + G.vel.y * SNIPER_PREDICTION_FRAMES));
+          G.enemyBeams.push({ id: id(), x1: shotX, y1: shotY, x2: aimX, y2: aimY, expiresAt: now + 180, type: 'sniper' });
+          if (pointToSegmentDistance(ship.x, ship.y, shotX, shotY, aimX, aimY) < 26) {
+            takeDamage(Math.max(1, Math.round(30 * ENEMY_DAMAGE_MULTIPLIER)));
             spawnParticles(ship.x, ship.y, 10, '#ff1177');
           }
           s = { ...s, lastShot: now, charging: false, freezeLeadMs: 0 };
         } else if (!s.charging && now - s.lastShot > 1700 && d > 450) {
           const chargeDuration = 1200;
           const freezeLeadMs = 250;
-          G.enemyBeams.push({ id: id(), x1: s.x, y1: s.y, x2: ship.x, y2: ship.y, expiresAt: now + chargeDuration, type: 'telegraph' });
+          G.enemyBeams.push({ id: id(), x1: s.x, y1: s.y, x2: ship.x, y2: ship.y, expiresAt: now + chargeDuration, type: 'telegraph', sourceShipId: s.id });
           s = { ...s, charging: true, chargeUntil: now + chargeDuration, freezeLeadMs, aimX: ship.x, aimY: ship.y, shotX: s.x, shotY: s.y };
         }
       } else if (isCaptain && now - s.lastShot > 280 && d < 560) {
@@ -630,7 +678,13 @@ export default function AsteroidShooter() {
         const trackDuration = 2000 + Math.random() * 1000;
         G.enemyMissiles.push({ id: id(), x: s.x, y: s.y, vx: Math.cos(a) * speed, vy: Math.sin(a) * speed, born: now, trackUntil: now + trackDuration });
         s = { ...s, lastShot: now };
-      } else if (!isSniper && !isCaptain && !isAggressive && !isGrenadier && now - s.lastShot > 500 && d < 500) {
+      } else if (isTank && now - s.lastShot > 120 && d < 700) {
+        const baseA = Math.atan2(dy, dx);
+        const a = baseA + (Math.random() - 0.5) * 0.7;
+        const bulletSpeed = 4.2;
+        G.enemyBullets.push({ id: id(), x: s.x, y: s.y, vx: Math.cos(a) * bulletSpeed, vy: Math.sin(a) * bulletSpeed, damage: 1, color: '#a78bfa' });
+        s = { ...s, lastShot: now };
+      } else if (!isSniper && !isCaptain && !isAggressive && !isGrenadier && !isTank && now - s.lastShot > 500 && d < 500) {
         const a = Math.atan2(dy, dx);
         G.enemyBullets.push({ id: id(), x: s.x, y: s.y, vx: Math.cos(a) * 4, vy: Math.sin(a) * 4, damage: 3, color: '#ff4444' });
         s = { ...s, lastShot: now };
@@ -652,7 +706,7 @@ export default function AsteroidShooter() {
       .filter(b => {
         if (b.x < 0 || b.x > W || b.y < 0 || b.y > H) return false;
         if (!G.invincible && dist(b.x, b.y, ship.x, ship.y) < 20) {
-          takeDamage(b.damage);
+          takeDamage(Math.max(1, Math.round(b.damage * ENEMY_DAMAGE_MULTIPLIER)));
           spawnParticles(ship.x, ship.y, 6, '#ff4444');
           return false;
         }
@@ -688,7 +742,7 @@ export default function AsteroidShooter() {
     }).filter(m => {
       if (m.x < -100 || m.x > W + 100 || m.y < -100 || m.y > H + 100) return false;
       if (!G.invincible && dist(m.x, m.y, ship.x, ship.y) < 22) {
-        takeDamage(20);
+        takeDamage(Math.max(1, Math.round(20 * ENEMY_DAMAGE_MULTIPLIER)));
         spawnParticles(ship.x, ship.y, 10, '#ff8800');
         return false;
       }
@@ -805,17 +859,21 @@ export default function AsteroidShooter() {
 
     // ── BEAM vs ASTEROIDS ──
     for (const beam of G.beams) {
+      if (!beam.hitAsteroidIds) beam.hitAsteroidIds = [];
+      if (!beam.hitShipIds) beam.hitShipIds = [];
       const dx = beam.targetX - ship.x, dy = beam.targetY - ship.y;
       const blen = Math.hypot(dx, dy);
       if (blen === 0) continue;
       const bw = hasPU('spread') ? 10 + ((beam.damage - 11) / 33) * 55 : 10;
       for (let ai = G.asteroids.length - 1; ai >= 0; ai--) {
         const a = G.asteroids[ai];
+        if (beam.hitAsteroidIds.includes(a.id)) continue;
         const ax = a.x - ship.x, ay = a.y - ship.y;
         const proj = (ax * dx + ay * dy) / (blen ** 2);
         if (proj < 0 || proj > 1) continue;
         const cx = ship.x + proj * dx, cy = ship.y + proj * dy;
         if (dist(a.x, a.y, cx, cy) < a.size + bw) {
+          beam.hitAsteroidIds.push(a.id);
           G.asteroids[ai] = { ...a, hp: a.hp - beam.damage };
           if (G.asteroids[ai].hp <= 0) {
             spawnParticles(a.x, a.y, 12, asteroidColor(a.type));
@@ -829,6 +887,7 @@ export default function AsteroidShooter() {
       // Beam vs enemy ships
       for (let si = G.enemyShips.length - 1; si >= 0; si--) {
         const enemyShip = G.enemyShips[si];
+        if (beam.hitShipIds.includes(enemyShip.id)) continue;
         const ex = enemyShip.x - ship.x;
         const ey = enemyShip.y - ship.y;
         const proj = (ex * dx + ey * dy) / (blen ** 2);
@@ -837,6 +896,7 @@ export default function AsteroidShooter() {
         const cy = ship.y + proj * dy;
         const shipRadius = 20;
         if (dist(enemyShip.x, enemyShip.y, cx, cy) < shipRadius + bw) {
+          beam.hitShipIds.push(enemyShip.id);
           G.enemyShips[si] = damageEnemyShip(enemyShip, beam.damage);
           spawnParticles(enemyShip.x, enemyShip.y, 4, enemyShip.shield > 0 ? '#66ccff' : '#ff8844');
           if (G.enemyShips[si].hp <= 0) {
@@ -901,7 +961,7 @@ export default function AsteroidShooter() {
           dmg = 11 * (1 + Math.min(1, hold / 3) * 3);
         }
         const bid = id();
-        G.beams.push({ id: bid, targetX: e.clientX, targetY: e.clientY, damage: dmg });
+        G.beams.push({ id: bid, targetX: e.clientX, targetY: e.clientY, damage: dmg, hitAsteroidIds: [], hitShipIds: [] });
         const count = hasRapid ? 3 : 1;
         const baseDuration = hasRapid ? 120 : 500;
         for (let i = 0; i < count; i++) {
@@ -965,18 +1025,24 @@ export default function AsteroidShooter() {
     const WAVE_INTERVAL_MS = 30000;
     const WAVE_WARNING_MS = 3000;
 
-    const scheduleNextWave = (delayMs: number) => {
+    const scheduleNextWave = (delayMs: number, withWarning = true) => {
       if (cancelled) return;
       const nextWave = G.wave + 1;
-      const warningTimeout = globalThis.setTimeout(() => {
-        if (!cancelled && G.running) {
-          playWaveMusicCue('incoming', nextWave);
-        }
-      }, Math.max(0, delayMs - WAVE_WARNING_MS));
-      waveScheduleTimeouts.push(warningTimeout);
+      if (withWarning) {
+        const warningTimeout = globalThis.setTimeout(() => {
+          if (!cancelled && G.running) {
+            playWaveMusicCue('incoming', nextWave);
+          }
+        }, Math.max(0, delayMs - WAVE_WARNING_MS));
+        waveScheduleTimeouts.push(warningTimeout);
+      }
 
       const startTimeout = globalThis.setTimeout(() => {
         if (cancelled || !G.running) return;
+        if (G.enemyShips.some(enemyShip => enemyShip.type === 'tank')) {
+          scheduleNextWave(1000, false);
+          return;
+        }
         G.wave += 1;
         playWaveMusicCue('start', G.wave);
         spawnEnemyWave(G.wave);
@@ -1054,6 +1120,7 @@ export default function AsteroidShooter() {
   // Read from G for rendering (tick forces re-render each frame)
   const ship = G.ship;
   const mouse = G.mouse;
+  const hpDisplayValue = Math.max(0, Math.round(G.hp));
   const hpDisplayColor = hpColor(G.hp, 100);
   const gameOverMessage = scoreMessage(G.score);
   const nowTs = Date.now();
@@ -1127,7 +1194,7 @@ export default function AsteroidShooter() {
               <div style={{ width: 18, height: 18, borderRadius: '50%', backgroundColor: deathDefiedDotColor, boxShadow: deathDefiedDotShadow, border: `2px solid ${deathDefiedDotBorder}`, transition: 'all .3s' }} />
             </div>
             <div className="mt-2">
-              <div className="text-sm mb-1" style={{ color: hpDisplayColor }}>HP: {G.hp}/100</div>
+              <div className="text-sm mb-1" style={{ color: hpDisplayColor }}>HP: {hpDisplayValue}/100</div>
               <div style={{ width: 180, height: 8, background: '#333', borderRadius: 4, border: '1px solid #666' }}>
                 <div style={{ width: `${G.hp}%`, height: '100%', borderRadius: 4, backgroundColor: hpDisplayColor, transition: 'width .2s,background-color .3s', boxShadow: `0 0 6px ${hpDisplayColor}` }} />
               </div>
@@ -1238,19 +1305,26 @@ export default function AsteroidShooter() {
                     <line x1="18" y1="4" x2="18" y2="-5" stroke="#88cc44" strokeWidth="2" />
                     <circle cx="18" cy="18" r="3" fill="#ddff88" opacity="0.7" />
                   </>
+                ) : s.type === 'tank' ? (
+                  <>
+                    <rect x="5" y="7" width="26" height="22" rx="3" fill="rgba(110,90,180,.9)" stroke="#a78bfa" strokeWidth="2" />
+                    <rect x="14" y="2" width="8" height="8" rx="2" fill="#c4b5fd" stroke="#ddd6fe" strokeWidth="1.5" />
+                    <line x1="18" y1="2" x2="18" y2="-7" stroke="#ddd6fe" strokeWidth="2" />
+                    {s.shield > 0 && <circle cx="18" cy="18" r="16" fill="none" stroke="#c4b5fd" strokeWidth="2" opacity="0.75" />}
+                  </>
                 ) : (
                   <polygon points="18,2 34,34 18,26 2,34" fill="rgba(180,0,0,.85)" stroke="#f44" strokeWidth="2" />
                 )}
               </svg>
               <div style={{ position: 'absolute', bottom: -8, left: '50%', transform: 'translateX(-50%)', width: 36, height: 3, background: '#333', borderRadius: 2 }}>
-                <div style={{ width: `${s.hp / s.maxHp * 100}%`, height: '100%', background: s.type === 'sniper' ? '#f6f' : s.type === 'captain' ? '#7dd3fc' : s.type === 'aggressive' ? '#ff9933' : s.type === 'grenadier' ? '#88cc44' : '#f44', borderRadius: 2 }} />
+                <div style={{ width: `${s.hp / s.maxHp * 100}%`, height: '100%', background: s.type === 'tank' ? '#a78bfa' : s.type === 'sniper' ? '#f6f' : s.type === 'captain' ? '#7dd3fc' : s.type === 'aggressive' ? '#ff9933' : s.type === 'grenadier' ? '#88cc44' : '#f44', borderRadius: 2 }} />
               </div>
               {s.maxShield > 0 && (
                 <div style={{ position: 'absolute', bottom: -13, left: '50%', transform: 'translateX(-50%)', width: 36, height: 2, background: '#223', borderRadius: 2 }}>
                   <div style={{ width: `${(s.shield / s.maxShield) * 100}%`, height: '100%', background: '#67e8f9', borderRadius: 2 }} />
                 </div>
               )}
-              <div style={{ position: 'absolute', top: -14, left: '50%', transform: 'translateX(-50%)', fontSize: 9, fontFamily: 'monospace', color: s.type === 'captain' ? '#7dd3fc' : s.type === 'aggressive' ? '#ffb366' : s.type === 'sniper' ? '#ff88ff' : s.type === 'grenadier' ? '#99dd55' : '#ff6666' }}>
+              <div style={{ position: 'absolute', top: -14, left: '50%', transform: 'translateX(-50%)', fontSize: 9, fontFamily: 'monospace', color: s.type === 'tank' ? '#d8b4fe' : s.type === 'captain' ? '#7dd3fc' : s.type === 'aggressive' ? '#ffb366' : s.type === 'sniper' ? '#ff88ff' : s.type === 'grenadier' ? '#99dd55' : '#ff6666' }}>
                 {s.type.toUpperCase()}
               </div>
             </div>
