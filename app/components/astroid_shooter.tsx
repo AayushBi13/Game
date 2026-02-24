@@ -8,17 +8,18 @@ interface Asteroid {
   id: number; x: number; y: number; size: number;
   speedX: number; speedY: number; rotation: number; rotationSpeed: number;
   hp: number; maxHp: number; type: 'normal' | 'fast' | 'armored' | 'splitting';
+  stunnedUntil?: number;
 }
-interface Bullet { id: number; x: number; y: number; vx: number; vy: number; }
+interface Bullet { id: number; x: number; y: number; vx: number; vy: number; damage: number; remainingPierce: number; maxRange: number; traveled: number; shrapnel: boolean; railcannon?: boolean; hitShipIds?: number[]; hitAsteroidIds?: number[]; }
 interface EnemyBullet { id: number; x: number; y: number; vx: number; vy: number; damage: number; color?: string; }
-interface EnemyShip { id: number; x: number; y: number; hp: number; maxHp: number; shield: number; maxShield: number; vx: number; vy: number; rotation: number; lastShot: number; type: 'fighter' | 'sniper' | 'captain' | 'aggressive' | 'grenadier' | 'tank'; charging: boolean; chargeUntil: number; freezeLeadMs: number; aimX: number; aimY: number; shotX: number; shotY: number; }
-interface EnemyBeam { id: number; x1: number; y1: number; x2: number; y2: number; expiresAt: number; type: 'telegraph' | 'sniper'; sourceShipId?: number; }
-interface EnemyMissile { id: number; x: number; y: number; vx: number; vy: number; born: number; trackUntil: number; }
+interface EnemyShip { id: number; x: number; y: number; hp: number; maxHp: number; shield: number; maxShield: number; vx: number; vy: number; rotation: number; lastShot: number; lastTankGrenadeAt: number; lastTankSnapAt: number; type: 'fighter' | 'sniper' | 'captain' | 'aggressive' | 'grenadier' | 'tank'; charging: boolean; chargeUntil: number; freezeLeadMs: number; aimX: number; aimY: number; shotX: number; shotY: number; stunnedUntil?: number; }
+interface EnemyBeam { id: number; x1: number; y1: number; x2: number; y2: number; expiresAt: number; type: 'telegraph' | 'sniper' | 'tankGrenade' | 'tankSnap' | 'tankSnapStrike'; sourceShipId?: number; }
+interface EnemyMissile { id: number; x: number; y: number; vx: number; vy: number; born: number; trackUntil: number; type?: 'homing' | 'tankGrenade' | 'tankSnap'; explodesAt?: number; stunMs?: number; blastRadius?: number; sourceShipId?: number; }
 interface Particle { id: number; x: number; y: number; vx: number; vy: number; life: number; size: number; color?: string; }
 interface PowerUp { id: number; x: number; y: number; type: 'shield' | 'rapidfire' | 'spread' | 'health' | 'overshield'; }
 interface ActivePowerUp { type: PowerUp['type']; endTime: number; startTime: number; }
 interface Beam { id: number; targetX: number; targetY: number; damage: number; hitAsteroidIds: number[]; hitShipIds: number[]; }
-interface Missile { id: number; x: number; y: number; vx: number; vy: number; targetId: number; targetType: 'asteroid' | 'ship'; born: number; }
+interface Missile { id: number; x: number; y: number; vx: number; vy: number; targetId: number; targetType: 'asteroid' | 'ship'; born: number; damage: number; ricochetCount: number; }
 interface AsteroidSpec { type: Asteroid['type']; size: number; hp: number; speedMul: number; }
 
 const DIFFICULTY_SCALER = 1;
@@ -43,6 +44,7 @@ const G = {
   vel: { x: 0, y: 0 },
   mouse: { x: 0, y: 0 },
   hp: 100,
+  playerStunUntil: 0,
   playerShield: 0,
   playerBaseShieldMax: 100,
   playerOverShieldMax: 100,
@@ -50,18 +52,25 @@ const G = {
   score: 0,
   invincible: false,
   deathDefied: false,
+  deathDefiedSlowUntil: 0,
   timeSlow: false,
   timeSlowCooldown: 0,
   missileCooldown: 0,
+  rapidSpinUp: 0,
+  spreadSpinUp: 0,
+  lastFrameAt: 0,
   nextId: 0,
   lastShot: 0,
   lastHit: 0,
   lastPlayerDamageAt: 0,
   lastShieldRegenAt: 0,
   wave: 0,
+  disableEnemySpawns: false,
   waveSpawnEndsAt: 0,
   waveEndCuePlayed: true,
+  waveDelayBlockedByTank: false,
   firstCaptainOverShieldDropped: false,
+  lastMissileRicochetAt: 0,
   running: false,
 };
 
@@ -111,6 +120,9 @@ function shouldDropOverShield(type: EnemyShip['type']) {
 
 function damageEnemyShip(ship: EnemyShip, damage: number) {
   if (ship.shield > 0) {
+    if (damage >= INSTA_KILL_DAMAGE_THRESHOLD) {
+      return { ...ship, shield: 0 };
+    }
     const absorbed = Math.min(ship.shield, damage);
     const remaining = damage - absorbed;
     return { ...ship, shield: ship.shield - absorbed, hp: ship.hp - remaining };
@@ -209,6 +221,51 @@ function asteroidSpecFromRoll(r: number): AsteroidSpec {
 }
 
 const TIME_SLOW_ANGLES = [0, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330];
+const DEATH_DEFIED_SHIELD_MS = 4000;
+const DEATH_DEFIED_SLOW_MS = 1400;
+const TANK_GRENADE_LIFE_MS = 5000;
+const TANK_GRENADE_STUN_MS = 2200;
+const TANK_GRENADE_RADIUS = 125;
+const TANK_SNAP_STUN_MS = 1400;
+const TANK_SNAP_BEAM_DAMAGE = 16;
+const TANK_SNAP_BEAM_WIDTH = 24;
+const TANK_SNAP_BEAM_MS = 180;
+const TANK_SNAP_LIFE_MS = 2200;
+const TANK_SNAP_TRACK_MS = 260;
+const RAPID_SPINUP_STEP = 0.2;
+const SPREAD_SPINUP_STEP = 0.18;
+const WEAPON_SPINUP_DECAY_PER_SECOND = 1.1;
+const RAPID_SPINUP_RATE_MULTIPLIER_MAX = 1.7;
+const RAPID_SPINUP_RATE_MULTIPLIER_MIN = 1.0;
+const RAPID_SPREAD_ANGLE_MAX = 0.1;
+const RAPID_SPREAD_ANGLE_MIN = 0.06;
+const SPREAD_SPINUP_RATE_MULTIPLIER_MAX = 1.35;
+const SPREAD_SPINUP_RATE_MULTIPLIER_MIN = 1.0;
+const PLAYER_BULLET_DAMAGE = 2;
+const PLAYER_BULLET_SPEED = 6;
+const PLAYER_BULLET_RANGE = 1200;
+const SHRAPNEL_PELLET_COUNT = 5;
+const SHRAPNEL_PELLET_STEP = 0.2;
+const SHRAPNEL_PELLET_DAMAGE = 1.5;
+const SHRAPNEL_PELLET_SPEED = 7;
+const SHRAPNEL_PELLET_RANGE = 320;
+const SHRAPNEL_PELLET_PIERCE = 1;
+const SHRAPNEL_KILL_POP_RADIUS = 90;
+const SHRAPNEL_KILL_POP_DAMAGE = 2;
+const CHARGED_RAILCANNON_MAX_CHARGE_SECONDS = 5;
+const INSTA_KILL_DAMAGE_THRESHOLD = 600;
+const RAILCANNON_SHOT_SPEED = 28;
+const RAILCANNON_MIN_RANGE = 700;
+const RAILCANNON_SHOT_RANGE = 2400;
+const RAILCANNON_SHOT_PIERCE = 8;
+const RAILCANNON_MIN_DAMAGE = 2;
+const RAILCANNON_MAX_DAMAGE = 300;
+const RAPIDFIRE_MOVE_SCALE = 0.65;
+const RAPIDFIRE_SHIELD_EFFECTIVE_HP = 2;
+const PLAYER_MISSILE_COUNT = 6;
+const PLAYER_MISSILE_BASE_DAMAGE = 10;
+const PLAYER_MISSILE_SINGLE_TARGET_DAMAGE = 6;
+const SHIELDED_MISSILE_RICOCHET_CHANCE = 0.4;
 
 export default function AsteroidShooter() {
   const [tick, setTick] = useState(0); // force re-render
@@ -216,10 +273,15 @@ export default function AsteroidShooter() {
   const [gameOver, setGameOver] = useState(false);
   const [mounted, setMounted] = useState(false);
   const [isCharging, setIsCharging] = useState(false);
+  const [enemySpawnCheatOff, setEnemySpawnCheatOff] = useState(false);
+  const [menuVisible, setMenuVisible] = useState(false);
+  const [noTimeSlowCooldownCheat, setNoTimeSlowCooldownCheat] = useState(false);
+  const [noMissileCooldownCheat, setNoMissileCooldownCheat] = useState(false);
 
   const rafRef = useRef(0);
   const keys = useRef(new Set<string>());
   const mouseDownAt = useRef(0);
+  const mousePressed = useRef(false);
   const gameOverRef = useRef(false);
   const timeoutIds = useRef<Array<ReturnType<typeof globalThis.setTimeout>>>([]);
 
@@ -239,25 +301,133 @@ export default function AsteroidShooter() {
     timeoutIds.current = [];
   }, []);
 
-  const scheduleBeamRemoval = useCallback((beamId: number, delay: number) => {
+  const scheduleMissileLaunch = useCallback((targetId: number, delay: number, damage = PLAYER_MISSILE_BASE_DAMAGE) => {
     scheduleTimeout(() => {
-      G.beams = G.beams.filter(beam => beam.id !== beamId);
+      G.missiles.push({ id: id(), x: G.ship.x, y: G.ship.y, vx: 0, vy: 0, targetId, targetType: 'asteroid', born: Date.now(), damage, ricochetCount: 0 });
     }, delay);
   }, [scheduleTimeout]);
 
-  const scheduleMissileLaunch = useCallback((targetId: number, delay: number) => {
+  const scheduleMissileLaunchToTarget = useCallback((targetId: number, targetType: Missile['targetType'], delay: number, damage = PLAYER_MISSILE_BASE_DAMAGE) => {
     scheduleTimeout(() => {
-      G.missiles.push({ id: id(), x: G.ship.x, y: G.ship.y, vx: 0, vy: 0, targetId, targetType: 'asteroid', born: Date.now() });
-    }, delay);
-  }, [scheduleTimeout]);
-
-  const scheduleMissileLaunchToTarget = useCallback((targetId: number, targetType: Missile['targetType'], delay: number) => {
-    scheduleTimeout(() => {
-      G.missiles.push({ id: id(), x: G.ship.x, y: G.ship.y, vx: 0, vy: 0, targetId, targetType, born: Date.now() });
+      G.missiles.push({ id: id(), x: G.ship.x, y: G.ship.y, vx: 0, vy: 0, targetId, targetType, born: Date.now(), damage, ricochetCount: 0 });
     }, delay);
   }, [scheduleTimeout]);
 
   const playWaveMusicCue = useCallback((_cueType: 'incoming' | 'start' | 'end', _waveNumber: number) => {
+  }, []);
+
+  const fireSpinUpShot = useCallback((targetX: number, targetY: number) => {
+    const hasRapid = hasPU('rapidfire');
+    const hasSpread = hasPU('spread');
+    if (!hasRapid && !hasSpread) return;
+
+    const now = Date.now();
+    const stunnedNow = now < G.playerStunUntil;
+    let rate = hasSpread ? 150 : 250;
+
+    if (hasRapid) {
+      const rapidfirePowerUp = G.activePowerUps.find(p => p.type === 'rapidfire');
+      if (rapidfirePowerUp) {
+        rate = Math.max(50, 100 - Math.min(1, (now - rapidfirePowerUp.startTime) / 15000) * 90);
+      }
+      rate *= RAPID_SPINUP_RATE_MULTIPLIER_MAX - G.rapidSpinUp * (RAPID_SPINUP_RATE_MULTIPLIER_MAX - RAPID_SPINUP_RATE_MULTIPLIER_MIN);
+    } else if (hasSpread) {
+      rate *= SPREAD_SPINUP_RATE_MULTIPLIER_MAX - G.spreadSpinUp * (SPREAD_SPINUP_RATE_MULTIPLIER_MAX - SPREAD_SPINUP_RATE_MULTIPLIER_MIN);
+    }
+
+    if (stunnedNow) {
+      rate *= 1.5;
+    }
+    if (now - G.lastShot < rate) return;
+
+    G.lastShot = now;
+    if (hasRapid) {
+      G.rapidSpinUp = Math.min(1, G.rapidSpinUp + RAPID_SPINUP_STEP);
+    }
+    if (hasSpread) {
+      G.spreadSpinUp = Math.min(1, G.spreadSpinUp + SPREAD_SPINUP_STEP);
+    }
+
+    const dx = targetX - G.ship.x;
+    const dy = targetY - G.ship.y;
+    const baseAngle = Math.atan2(dy, dx);
+    if (hasRapid) {
+      const spreadAngle = RAPID_SPREAD_ANGLE_MAX - G.rapidSpinUp * (RAPID_SPREAD_ANGLE_MAX - RAPID_SPREAD_ANGLE_MIN);
+      const rapidOffset = (Math.random() * 2 - 1) * spreadAngle;
+      const ang = baseAngle + rapidOffset;
+      G.bullets.push({
+        id: id(),
+        x: G.ship.x,
+        y: G.ship.y,
+        vx: Math.cos(ang) * PLAYER_BULLET_SPEED,
+        vy: Math.sin(ang) * PLAYER_BULLET_SPEED,
+        damage: PLAYER_BULLET_DAMAGE,
+        remainingPierce: 0,
+        maxRange: Number.POSITIVE_INFINITY,
+        traveled: 0,
+        shrapnel: false,
+      });
+      return;
+    }
+    if (hasSpread) {
+      const half = (SHRAPNEL_PELLET_COUNT - 1) / 2;
+      for (let i = 0; i < SHRAPNEL_PELLET_COUNT; i++) {
+        const spreadOffset = (i - half) * SHRAPNEL_PELLET_STEP;
+        const ang = baseAngle + spreadOffset;
+        G.bullets.push({
+          id: id(),
+          x: G.ship.x,
+          y: G.ship.y,
+          vx: Math.cos(ang) * SHRAPNEL_PELLET_SPEED,
+          vy: Math.sin(ang) * SHRAPNEL_PELLET_SPEED,
+          damage: SHRAPNEL_PELLET_DAMAGE,
+          remainingPierce: SHRAPNEL_PELLET_PIERCE,
+          maxRange: SHRAPNEL_PELLET_RANGE,
+          traveled: 0,
+          shrapnel: true,
+        });
+      }
+      return;
+    }
+    G.bullets.push({
+      id: id(),
+      x: G.ship.x,
+      y: G.ship.y,
+      vx: Math.cos(baseAngle) * PLAYER_BULLET_SPEED,
+      vy: Math.sin(baseAngle) * PLAYER_BULLET_SPEED,
+      damage: PLAYER_BULLET_DAMAGE,
+      remainingPierce: 0,
+      maxRange: Number.POSITIVE_INFINITY,
+      traveled: 0,
+      shrapnel: false,
+    });
+  }, []);
+
+  const setDisableEnemySpawnCheat = useCallback((disabled: boolean) => {
+    G.disableEnemySpawns = disabled;
+    setEnemySpawnCheatOff(disabled);
+  }, []);
+
+  const grantDeathDefiedCheat = useCallback(() => {
+    G.deathsDefied += 1;
+  }, []);
+
+  const grantPickableCheat = useCallback((type: PowerUp['type']) => {
+    const now = Date.now();
+    if (type === 'health') {
+      G.hp = Math.min(100, G.hp + 30);
+      return;
+    }
+    if (type === 'shield') {
+      G.playerShield = Math.min(G.playerBaseShieldMax, G.playerShield + 40);
+      return;
+    }
+    if (type === 'overshield') {
+      G.playerShield = G.playerBaseShieldMax + G.playerOverShieldMax;
+      return;
+    }
+    G.activePowerUps = G.activePowerUps.filter(a => a.type !== type && !(type === 'rapidfire' && a.type === 'spread') && !(type === 'spread' && a.type === 'rapidfire'));
+    G.activePowerUps.push({ type, endTime: now + 30000, startTime: now });
   }, []);
 
   useEffect(() => { setMounted(true); }, []);
@@ -270,9 +440,12 @@ export default function AsteroidShooter() {
     G.lastShieldRegenAt = now;
     let remainingDamage = amount;
     if (G.playerShield > 0) {
-      const absorbed = Math.min(G.playerShield, remainingDamage);
+      const rapidShieldBuffActive = hasPU('rapidfire');
+      const shieldDamage = rapidShieldBuffActive ? remainingDamage / RAPIDFIRE_SHIELD_EFFECTIVE_HP : remainingDamage;
+      const absorbed = Math.min(G.playerShield, shieldDamage);
       G.playerShield -= absorbed;
-      remainingDamage -= absorbed;
+      remainingDamage -= rapidShieldBuffActive ? absorbed * RAPIDFIRE_SHIELD_EFFECTIVE_HP : absorbed;
+      remainingDamage = Math.max(0, remainingDamage);
     }
     if (remainingDamage <= 0) return;
     G.hp -= remainingDamage;
@@ -283,10 +456,12 @@ export default function AsteroidShooter() {
         G.playerShield = 0;
         G.invincible = true;
         G.deathDefied = true;
+        G.deathDefiedSlowUntil = now + DEATH_DEFIED_SLOW_MS;
         scheduleTimeout(() => {
           G.invincible = false;
           G.deathDefied = false;
-        }, 3000);
+          G.deathDefiedSlowUntil = 0;
+        }, DEATH_DEFIED_SHIELD_MS);
       } else {
         G.running = false;
         G.hp = 0;
@@ -335,14 +510,19 @@ export default function AsteroidShooter() {
     else if (shipType === 'captain') { hp = 14; shield = 20; }
     else if (shipType === 'grenadier') hp = 9;
     else if (shipType === 'aggressive') hp = 6;
-    else if (shipType === 'tank') { hp = 500; shield = 250; }
+    else if (shipType === 'tank') { hp = 300; shield = 120; }
 
     if (shipType !== 'tank') {
       hp = Math.max(1, Math.round(hp * 1.3 * ENEMY_HP_MULTIPLIER));
     }
 
-    G.enemyShips.push({ id: id(), x, y, hp, maxHp: hp, shield, maxShield: shield, vx: 0, vy: 0, rotation: 0, lastShot: Date.now(), type: shipType, charging: false, chargeUntil: 0, freezeLeadMs: 0, aimX: 0, aimY: 0, shotX: 0, shotY: 0 });
+    G.enemyShips.push({ id: id(), x, y, hp, maxHp: hp, shield, maxShield: shield, vx: 0, vy: 0, rotation: 0, lastShot: Date.now(), lastTankGrenadeAt: Date.now(), lastTankSnapAt: Date.now(), type: shipType, charging: false, chargeUntil: 0, freezeLeadMs: 0, aimX: 0, aimY: 0, shotX: 0, shotY: 0 });
   }, []);
+
+  const manualSpawnEnemy = useCallback((type: EnemyShip['type']) => {
+    if (!G.running) return;
+    spawnEnemyShip(type);
+  }, [spawnEnemyShip]);
 
   const spawnEnemyWave = useCallback((waveNumber: number) => {
     let fighterCount: number;
@@ -440,6 +620,7 @@ export default function AsteroidShooter() {
     waveShips.forEach((shipType, index) => {
       scheduleTimeout(() => {
         if (!G.running) return;
+        if (G.disableEnemySpawns) return;
         spawnEnemyShip(shipType);
       }, index * spawnGap);
     });
@@ -449,21 +630,60 @@ export default function AsteroidShooter() {
   const loop = useCallback(() => {
     if (!G.running) return;
     const now = Date.now();
-    const slow = G.timeSlow || G.deathDefied ? 0.3 : 1;
+    const dtSeconds = G.lastFrameAt > 0 ? Math.min(0.1, (now - G.lastFrameAt) / 1000) : 1 / 60;
+    G.lastFrameAt = now;
+    const deathDefiedSlowActive = now < G.deathDefiedSlowUntil;
+    const slow = G.timeSlow || deathDefiedSlowActive ? 0.3 : 1;
+    const enemyTimeScale = 1 / slow;
     const W = window.innerWidth, H = window.innerHeight;
     const ship = G.ship;
+    const playerStunned = now < G.playerStunUntil;
+
+    const hasRapidNow = hasPU('rapidfire');
+    const hasSpreadNow = hasPU('spread');
+    const spinUpHolding = mousePressed.current && (hasRapidNow || hasSpreadNow);
+    if (playerStunned) {
+      G.rapidSpinUp = 0;
+      G.spreadSpinUp = 0;
+    } else if (!spinUpHolding) {
+      const decay = WEAPON_SPINUP_DECAY_PER_SECOND * dtSeconds;
+      if (!hasRapidNow || G.rapidSpinUp > 0) {
+        G.rapidSpinUp = Math.max(0, G.rapidSpinUp - decay);
+      }
+      if (!hasSpreadNow || G.spreadSpinUp > 0) {
+        G.spreadSpinUp = Math.max(0, G.spreadSpinUp - decay);
+      }
+      if (!hasRapidNow) G.rapidSpinUp = 0;
+      if (!hasSpreadNow) G.spreadSpinUp = 0;
+    }
+
+    if (spinUpHolding) {
+      fireSpinUpShot(G.mouse.x, G.mouse.y);
+    }
 
     // Ship movement
-    const accel = 0.3, maxS = 3, fric = 0.92;
-    if (keys.current.has('w') || keys.current.has('arrowup')) G.vel.y -= accel;
-    if (keys.current.has('s') || keys.current.has('arrowdown')) G.vel.y += accel;
-    if (keys.current.has('a') || keys.current.has('arrowleft')) G.vel.x -= accel;
-    if (keys.current.has('d') || keys.current.has('arrowright')) G.vel.x += accel;
-    G.vel.x *= fric; G.vel.y *= fric;
-    const spd = Math.hypot(G.vel.x, G.vel.y);
-    if (spd > maxS) { G.vel.x = G.vel.x / spd * maxS; G.vel.y = G.vel.y / spd * maxS; }
-    ship.x = Math.max(30, Math.min(W - 30, ship.x + G.vel.x));
-    ship.y = Math.max(30, Math.min(H - 30, ship.y + G.vel.y));
+    const chargingNormalShot = mousePressed.current && mouseDownAt.current > 0 && !hasRapidNow && !hasSpreadNow;
+    const chargeHoldSeconds = chargingNormalShot ? Math.max(0, (now - mouseDownAt.current) / 1000) : 0;
+    const chargeRatioNow = Math.min(1, chargeHoldSeconds / CHARGED_RAILCANNON_MAX_CHARGE_SECONDS);
+    const chargeMoveScale = 1 - chargeRatioNow * 0.6;
+    const spreadMoveBuffScale = hasSpreadNow ? 1.25 : 1;
+    const rapidMoveScale = hasRapidNow ? RAPIDFIRE_MOVE_SCALE : 1;
+    const totalMoveScale = spreadMoveBuffScale * rapidMoveScale;
+    const accel = 0.3 * chargeMoveScale, maxS = 3 * chargeMoveScale, fric = 0.92;
+    if (!playerStunned) {
+      if (keys.current.has('w') || keys.current.has('arrowup')) G.vel.y -= accel;
+      if (keys.current.has('s') || keys.current.has('arrowdown')) G.vel.y += accel;
+      if (keys.current.has('a') || keys.current.has('arrowleft')) G.vel.x -= accel;
+      if (keys.current.has('d') || keys.current.has('arrowright')) G.vel.x += accel;
+      G.vel.x *= fric; G.vel.y *= fric;
+      const spd = Math.hypot(G.vel.x, G.vel.y);
+      if (spd > maxS) { G.vel.x = G.vel.x / spd * maxS; G.vel.y = G.vel.y / spd * maxS; }
+      ship.x = Math.max(30, Math.min(W - 30, ship.x + G.vel.x * totalMoveScale));
+      ship.y = Math.max(30, Math.min(H - 30, ship.y + G.vel.y * totalMoveScale));
+    } else {
+      G.vel.x = 0;
+      G.vel.y = 0;
+    }
 
     // Player shield recharge (base shield only)
     if (now - G.lastPlayerDamageAt >= 2000 && G.playerShield < G.playerBaseShieldMax) {
@@ -498,8 +718,8 @@ export default function AsteroidShooter() {
     // Asteroids
     G.asteroids = G.asteroids.map(a => ({
       ...a,
-      x: a.x + a.speedX * slow,
-      y: a.y + a.speedY * slow,
+      x: a.x + (now < (a.stunnedUntil ?? 0) ? 0 : a.speedX * slow),
+      y: a.y + (now < (a.stunnedUntil ?? 0) ? 0 : a.speedY * slow),
       rotation: a.rotation + a.rotationSpeed,
     })).filter(a => {
       if (a.x < -150 || a.x > W + 150 || a.y < -150 || a.y > H + 150) return false;
@@ -517,8 +737,16 @@ export default function AsteroidShooter() {
     });
 
     // Bullets
-    G.bullets = G.bullets.map(b => ({ ...b, x: b.x + b.vx, y: b.y + b.vy }))
-      .filter(b => b.x > 0 && b.x < W && b.y > 0 && b.y < H);
+    G.bullets = G.bullets.map(b => {
+      const nextX = b.x + b.vx;
+      const nextY = b.y + b.vy;
+      return {
+        ...b,
+        x: nextX,
+        y: nextY,
+        traveled: b.traveled + Math.hypot(b.vx, b.vy),
+      };
+    }).filter(b => b.x > 0 && b.x < W && b.y > 0 && b.y < H && b.traveled <= b.maxRange);
 
     // Missiles
     G.missiles = G.missiles.map(m => {
@@ -578,6 +806,7 @@ export default function AsteroidShooter() {
     G.enemyShips = G.enemyShips.map(s => {
       const dx = ship.x - s.x, dy = ship.y - s.y;
       const d = Math.hypot(dx, dy);
+      const shipStunned = now < (s.stunnedUntil ?? 0);
       const isSniper = s.type === 'sniper';
       const isCaptain = s.type === 'captain';
       const isAggressive = s.type === 'aggressive';
@@ -614,7 +843,10 @@ export default function AsteroidShooter() {
         accelAway = 0.04;
       }
       let vx = s.vx, vy = s.vy;
-      if (d > 0) {
+      if (shipStunned) {
+        vx = 0;
+        vy = 0;
+      } else if (d > 0) {
         if (d > target + 50) {
           vx += dx / d * accelToward;
           vy += dy / d * accelToward;
@@ -625,6 +857,10 @@ export default function AsteroidShooter() {
       }
       const sp = Math.hypot(vx, vy);
       if (sp > maxSpd) { vx = vx / sp * maxSpd; vy = vy / sp * maxSpd; }
+      if (shipStunned) {
+        return { ...s, x: s.x, y: s.y, vx: 0, vy: 0, rotation: Math.atan2(dy, dx) * 180 / Math.PI + 90 };
+      }
+
       if (isSniper) {
         const chargeRemaining = s.chargeUntil - now;
         if (s.charging && chargeRemaining > 0 && chargeRemaining <= s.freezeLeadMs) {
@@ -649,22 +885,35 @@ export default function AsteroidShooter() {
           const aimX = Math.max(0, Math.min(W, ship.x + G.vel.x * SNIPER_PREDICTION_FRAMES));
           const aimY = Math.max(0, Math.min(H, ship.y + G.vel.y * SNIPER_PREDICTION_FRAMES));
           G.enemyBeams.push({ id: id(), x1: shotX, y1: shotY, x2: aimX, y2: aimY, expiresAt: now + 180, type: 'sniper' });
+
+          for (let ai = G.asteroids.length - 1; ai >= 0; ai--) {
+            const a = G.asteroids[ai];
+            if (pointToSegmentDistance(a.x, a.y, shotX, shotY, aimX, aimY) < a.size + 4) {
+              G.asteroids[ai] = { ...a, hp: a.hp - 14 };
+              spawnParticles(a.x, a.y, 8, '#ff88dd');
+              if (G.asteroids[ai].hp <= 0) {
+                spawnParticles(a.x, a.y, 12, asteroidColor(a.type));
+                G.asteroids.splice(ai, 1);
+              }
+            }
+          }
+
           if (pointToSegmentDistance(ship.x, ship.y, shotX, shotY, aimX, aimY) < 26) {
             takeDamage(Math.max(1, Math.round(30 * ENEMY_DAMAGE_MULTIPLIER)));
             spawnParticles(ship.x, ship.y, 10, '#ff1177');
           }
           s = { ...s, lastShot: now, charging: false, freezeLeadMs: 0 };
-        } else if (!s.charging && now - s.lastShot > 1700 && d > 450) {
-          const chargeDuration = 1200;
-          const freezeLeadMs = 250;
+        } else if (!s.charging && now - s.lastShot > 1700 * enemyTimeScale && d > 450) {
+          const chargeDuration = 1200 * enemyTimeScale;
+          const freezeLeadMs = 250 * enemyTimeScale;
           G.enemyBeams.push({ id: id(), x1: s.x, y1: s.y, x2: ship.x, y2: ship.y, expiresAt: now + chargeDuration, type: 'telegraph', sourceShipId: s.id });
           s = { ...s, charging: true, chargeUntil: now + chargeDuration, freezeLeadMs, aimX: ship.x, aimY: ship.y, shotX: s.x, shotY: s.y };
         }
-      } else if (isCaptain && now - s.lastShot > 280 && d < 560) {
+      } else if (isCaptain && now - s.lastShot > 280 * enemyTimeScale && d < 560) {
         const a = Math.atan2(dy, dx);
         G.enemyBullets.push({ id: id(), x: s.x, y: s.y, vx: Math.cos(a) * 5.4, vy: Math.sin(a) * 5.4, damage: 4, color: '#7dd3fc' });
         s = { ...s, lastShot: now };
-      } else if (isAggressive && now - s.lastShot > 850 && d < 340) {
+      } else if (isAggressive && now - s.lastShot > 850 * enemyTimeScale && d < 340) {
         const baseA = Math.atan2(dy, dx);
         const spread = 0.22;
         for (let i = -2; i <= 2; i++) {
@@ -672,24 +921,92 @@ export default function AsteroidShooter() {
           G.enemyBullets.push({ id: id(), x: s.x, y: s.y, vx: Math.cos(a) * 4.5, vy: Math.sin(a) * 4.5, damage: 2, color: '#ff9933' });
         }
         s = { ...s, lastShot: now };
-      } else if (isGrenadier && now - s.lastShot > 5000 + Math.random() * 1000 && d < 550) {
+      } else if (isGrenadier && now - s.lastShot > (5000 + Math.random() * 1000) * enemyTimeScale && d < 550) {
         const a = Math.atan2(dy, dx);
         const speed = 2.8;
-        const trackDuration = 2000 + Math.random() * 1000;
+        const trackDuration = (2000 + Math.random() * 1000) * enemyTimeScale;
         G.enemyMissiles.push({ id: id(), x: s.x, y: s.y, vx: Math.cos(a) * speed, vy: Math.sin(a) * speed, born: now, trackUntil: now + trackDuration });
         s = { ...s, lastShot: now };
-      } else if (isTank && now - s.lastShot > 120 && d < 700) {
-        const baseA = Math.atan2(dy, dx);
-        const a = baseA + (Math.random() - 0.5) * 0.7;
+      } else if (isTank && now - s.lastShot > 120 * enemyTimeScale && d < 700) {
+        const predictedX = ship.x + G.vel.x * 1.8;
+        const predictedY = ship.y + G.vel.y * 1.8;
+        const baseA = Math.atan2(predictedY - s.y, predictedX - s.x);
+        const a = baseA + (Math.random() - 0.5) * 0.476;
         const bulletSpeed = 4.2;
-        G.enemyBullets.push({ id: id(), x: s.x, y: s.y, vx: Math.cos(a) * bulletSpeed, vy: Math.sin(a) * bulletSpeed, damage: 1, color: '#a78bfa' });
+        G.enemyBullets.push({ id: id(), x: s.x, y: s.y, vx: Math.cos(a) * bulletSpeed, vy: Math.sin(a) * bulletSpeed, damage: 5, color: '#a78bfa' });
         s = { ...s, lastShot: now };
-      } else if (!isSniper && !isCaptain && !isAggressive && !isGrenadier && !isTank && now - s.lastShot > 500 && d < 500) {
+      } else if (!isSniper && !isCaptain && !isAggressive && !isGrenadier && !isTank && now - s.lastShot > 500 * enemyTimeScale && d < 500) {
         const a = Math.atan2(dy, dx);
         G.enemyBullets.push({ id: id(), x: s.x, y: s.y, vx: Math.cos(a) * 4, vy: Math.sin(a) * 4, damage: 3, color: '#ff4444' });
         s = { ...s, lastShot: now };
       }
-      return { ...s, x: s.x + vx, y: s.y + vy, vx, vy, rotation: Math.atan2(dy, dx) * 180 / Math.PI + 90 };
+
+      if (isTank && now - s.lastTankGrenadeAt > 9000 * enemyTimeScale && d < 850) {
+        const telegraphMs = 900;
+        G.enemyBeams.push({ id: id(), x1: s.x, y1: s.y, x2: ship.x, y2: ship.y, expiresAt: now + telegraphMs, type: 'tankGrenade', sourceShipId: s.id });
+        const tankId = s.id;
+        scheduleTimeout(() => {
+          const src = G.enemyShips.find(es => es.id === tankId);
+          if (!src || !G.running) return;
+          const a = Math.atan2(G.ship.y - src.y, G.ship.x - src.x);
+          const grenadeSpeed = 1.6;
+          G.enemyMissiles.push({
+            id: id(),
+            x: src.x,
+            y: src.y,
+            vx: Math.cos(a) * grenadeSpeed,
+            vy: Math.sin(a) * grenadeSpeed,
+            born: Date.now(),
+            trackUntil: Date.now() + TANK_GRENADE_LIFE_MS,
+            type: 'tankGrenade',
+            explodesAt: Date.now() + TANK_GRENADE_LIFE_MS,
+            stunMs: TANK_GRENADE_STUN_MS,
+            blastRadius: TANK_GRENADE_RADIUS,
+            sourceShipId: tankId,
+          });
+        }, telegraphMs);
+        s = { ...s, lastTankGrenadeAt: now };
+      }
+
+      if (isTank && now - s.lastTankSnapAt > 6500 * enemyTimeScale && d < 760) {
+        const telegraphMs = 820;
+        G.enemyBeams.push({ id: id(), x1: s.x, y1: s.y, x2: ship.x, y2: ship.y, expiresAt: now + telegraphMs, type: 'tankSnap', sourceShipId: s.id });
+        const tankId = s.id;
+        scheduleTimeout(() => {
+          const src = G.enemyShips.find(es => es.id === tankId);
+          if (!src || !G.running) return;
+          const snapNow = Date.now();
+          const aimX = Math.max(0, Math.min(W, G.ship.x + G.vel.x * 10));
+          const aimY = Math.max(0, Math.min(H, G.ship.y + G.vel.y * 10));
+
+          G.enemyBeams.push({
+            id: id(),
+            x1: src.x,
+            y1: src.y,
+            x2: aimX,
+            y2: aimY,
+            expiresAt: snapNow + TANK_SNAP_BEAM_MS,
+            type: 'tankSnapStrike',
+            sourceShipId: src.id,
+          });
+
+          if (pointToSegmentDistance(G.ship.x, G.ship.y, src.x, src.y, aimX, aimY) < TANK_SNAP_BEAM_WIDTH) {
+            G.playerStunUntil = Math.max(G.playerStunUntil, snapNow + TANK_SNAP_STUN_MS);
+            takeDamage(Math.max(1, Math.round(TANK_SNAP_BEAM_DAMAGE * ENEMY_DAMAGE_MULTIPLIER)));
+            spawnParticles(G.ship.x, G.ship.y, 12, '#d8b4fe');
+          }
+
+          for (let ai = G.asteroids.length - 1; ai >= 0; ai--) {
+            const a = G.asteroids[ai];
+            if (pointToSegmentDistance(a.x, a.y, src.x, src.y, aimX, aimY) < a.size + 6) {
+              damageAsteroidFromEnemyWeapon(ai, TANK_SNAP_BEAM_DAMAGE, '#c4b5fd');
+            }
+          }
+        }, telegraphMs);
+        s = { ...s, lastTankSnapAt: now };
+      }
+
+      return { ...s, x: s.x + vx * slow, y: s.y + vy * slow, vx, vy, rotation: Math.atan2(dy, dx) * 180 / Math.PI + 90 };
     }).filter(s => s.x > -200 && s.x < W + 200 && s.y > -200 && s.y < H + 200);
 
     // Enemy beams (visual lifetime)
@@ -700,11 +1017,40 @@ export default function AsteroidShooter() {
       G.waveEndCuePlayed = true;
     }
 
+    const damageAsteroidFromEnemyWeapon = (asteroidIndex: number, damage: number, particleColor?: string) => {
+      const asteroid = G.asteroids[asteroidIndex];
+      if (!asteroid) return;
+      G.asteroids[asteroidIndex] = { ...asteroid, hp: asteroid.hp - damage };
+      if (particleColor) {
+        spawnParticles(asteroid.x, asteroid.y, 5, particleColor);
+      }
+      if (G.asteroids[asteroidIndex].hp <= 0) {
+        spawnParticles(asteroid.x, asteroid.y, 12, asteroidColor(asteroid.type));
+        if (asteroid.type === 'splitting') {
+          for (let k = 0; k < 3; k++) {
+            const ang = (Math.PI * 2 * k) / 3 + Math.random() * 0.5;
+            const s = 1 + Math.random() * 1.5;
+            G.asteroids.push({ id: id(), x: asteroid.x, y: asteroid.y, size: 20, speedX: Math.cos(ang) * s, speedY: Math.sin(ang) * s, rotation: Math.random() * 360, rotationSpeed: (Math.random() - 0.5) * 3, hp: 1, maxHp: 1, type: 'fast' });
+          }
+        }
+        G.asteroids.splice(asteroidIndex, 1);
+      }
+    };
+
     // Enemy bullets
     G.enemyBullets = G.enemyBullets
-      .map(b => ({ ...b, x: b.x + b.vx, y: b.y + b.vy }))
+      .map(b => ({ ...b, x: b.x + b.vx * slow, y: b.y + b.vy * slow }))
       .filter(b => {
         if (b.x < 0 || b.x > W || b.y < 0 || b.y > H) return false;
+
+        for (let ai = G.asteroids.length - 1; ai >= 0; ai--) {
+          const a = G.asteroids[ai];
+          if (dist(b.x, b.y, a.x, a.y) < a.size) {
+            damageAsteroidFromEnemyWeapon(ai, Math.max(1, Math.round(b.damage * 1.2)), '#ff8866');
+            return false;
+          }
+        }
+
         if (!G.invincible && dist(b.x, b.y, ship.x, ship.y) < 20) {
           takeDamage(Math.max(1, Math.round(b.damage * ENEMY_DAMAGE_MULTIPLIER)));
           spawnParticles(ship.x, ship.y, 6, '#ff4444');
@@ -715,9 +1061,46 @@ export default function AsteroidShooter() {
 
     // Enemy missiles (homing)
     G.enemyMissiles = G.enemyMissiles.map(m => {
+      if (m.type === 'tankGrenade' && now >= (m.explodesAt ?? m.trackUntil)) {
+        const blastRadius = m.blastRadius ?? TANK_GRENADE_RADIUS;
+        const stunMs = m.stunMs ?? TANK_GRENADE_STUN_MS;
+        spawnParticles(m.x, m.y, 18, '#f5d76e');
+        G.enemyBeams.push({ id: id(), x1: m.x - blastRadius, y1: m.y, x2: m.x + blastRadius, y2: m.y, expiresAt: now + 240, type: 'tankGrenade' });
+        G.enemyBeams.push({ id: id(), x1: m.x, y1: m.y - blastRadius, x2: m.x, y2: m.y + blastRadius, expiresAt: now + 240, type: 'tankGrenade' });
+        if (dist(m.x, m.y, ship.x, ship.y) <= blastRadius) {
+          G.playerStunUntil = Math.max(G.playerStunUntil, now + stunMs);
+        }
+        G.asteroids = G.asteroids.map(a => (dist(m.x, m.y, a.x, a.y) <= blastRadius + a.size
+          ? { ...a, stunnedUntil: Math.max(a.stunnedUntil ?? 0, now + stunMs) }
+          : a));
+        G.enemyShips = G.enemyShips.map(es => (dist(m.x, m.y, es.x, es.y) <= blastRadius + 18
+          ? { ...es, stunnedUntil: Math.max(es.stunnedUntil ?? 0, now + stunMs) }
+          : es));
+        if (m.sourceShipId !== undefined) {
+          G.enemyShips = G.enemyShips.map(es => (
+            es.id === m.sourceShipId
+              ? { ...es, stunnedUntil: Math.max(es.stunnedUntil ?? 0, now + stunMs) }
+              : es
+          ));
+        }
+        return { ...m, x: -9999, y: -9999 };
+      }
+
       let newVx = m.vx;
       let newVy = m.vy;
-      if (now < m.trackUntil) {
+      if (m.type === 'tankSnap' && now < m.trackUntil) {
+        const dxToPlayer = ship.x - m.x;
+        const dyToPlayer = ship.y - m.y;
+        const targetAngle = Math.atan2(dyToPlayer, dxToPlayer);
+        const currentAngle = Math.atan2(m.vy, m.vx);
+        let angleDiff = targetAngle - currentAngle;
+        while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
+        while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
+        const newAngle = currentAngle + angleDiff * 0.09;
+        const speed = Math.max(4.7, Math.hypot(m.vx, m.vy));
+        newVx = Math.cos(newAngle) * speed;
+        newVy = Math.sin(newAngle) * speed;
+      } else if (now < m.trackUntil) {
         const dx = ship.x - m.x;
         const dy = ship.y - m.y;
         const targetAngle = Math.atan2(dy, dx);
@@ -734,17 +1117,44 @@ export default function AsteroidShooter() {
       }
       return {
         ...m,
-        x: m.x + newVx,
-        y: m.y + newVy,
+        x: m.x + newVx * slow,
+        y: m.y + newVy * slow,
         vx: newVx,
         vy: newVy,
       };
     }).filter(m => {
       if (m.x < -100 || m.x > W + 100 || m.y < -100 || m.y > H + 100) return false;
-      if (!G.invincible && dist(m.x, m.y, ship.x, ship.y) < 22) {
-        takeDamage(Math.max(1, Math.round(20 * ENEMY_DAMAGE_MULTIPLIER)));
-        spawnParticles(ship.x, ship.y, 10, '#ff8800');
-        return false;
+      if (m.type === 'tankSnap' && now - m.born > TANK_SNAP_LIFE_MS) return false;
+
+      for (let ai = G.asteroids.length - 1; ai >= 0; ai--) {
+        const a = G.asteroids[ai];
+        if (dist(m.x, m.y, a.x, a.y) < a.size + 6) {
+          if (m.type === 'tankSnap') {
+            G.asteroids[ai] = { ...a, stunnedUntil: Math.max(a.stunnedUntil ?? 0, now + (m.stunMs ?? TANK_SNAP_STUN_MS)) };
+            spawnParticles(a.x, a.y, 8, '#c4b5fd');
+            return false;
+          }
+          if (m.type !== 'tankGrenade') {
+            damageAsteroidFromEnemyWeapon(ai, 10, '#ffaa66');
+            return false;
+          }
+        }
+      }
+
+      if (m.type === 'tankGrenade') {
+        return true;
+      }
+      if (dist(m.x, m.y, ship.x, ship.y) < 22) {
+        if (m.type === 'tankSnap') {
+          G.playerStunUntil = Math.max(G.playerStunUntil, now + (m.stunMs ?? TANK_SNAP_STUN_MS));
+          spawnParticles(ship.x, ship.y, 10, '#d8b4fe');
+          return false;
+        }
+        if (!G.invincible) {
+          takeDamage(Math.max(1, Math.round(20 * ENEMY_DAMAGE_MULTIPLIER)));
+          spawnParticles(ship.x, ship.y, 10, '#ff8800');
+          return false;
+        }
       }
       return true;
     });
@@ -753,22 +1163,56 @@ export default function AsteroidShooter() {
     // Both arrays are plain JS arrays in G — no React state involved
     const usedBullets = new Set<number>();
     for (let si = G.enemyShips.length - 1; si >= 0; si--) {
-      const ship2 = G.enemyShips[si];
       for (let bi = G.bullets.length - 1; bi >= 0; bi--) {
         const b = G.bullets[bi];
         if (usedBullets.has(b.id)) continue;
+        const ship2 = G.enemyShips[si];
+        if (!ship2) continue;
+        if ((b.hitShipIds ?? []).includes(ship2.id)) continue;
         if (dist(b.x, b.y, ship2.x, ship2.y) < 30) {
-          usedBullets.add(b.id);
-          G.enemyShips[si] = damageEnemyShip(ship2, 2);
+          G.enemyShips[si] = damageEnemyShip(ship2, b.damage);
           if (ship2.shield > 0) {
             spawnParticles(ship2.x, ship2.y, 4, '#66ccff');
           }
-          if (G.enemyShips[si].hp <= 0) {
+          const hitShipIds = [...(b.hitShipIds ?? []), ship2.id];
+          if (b.remainingPierce > 0) {
+            G.bullets[bi] = { ...b, remainingPierce: b.remainingPierce - 1, hitShipIds };
+          } else {
+            usedBullets.add(b.id);
+          }
+          if (G.enemyShips[si] && G.enemyShips[si].hp <= 0) {
             spawnParticles(ship2.x, ship2.y, 15, '#ff6600');
             G.score += enemyShipReward(ship2.type);
             if (Math.random() < enemyShipDropChance(ship2.type)) spawnPowerUp(ship2.x, ship2.y);
             if (shouldDropOverShield(ship2.type)) spawnOverShieldPowerUp(ship2.x, ship2.y);
             G.enemyShips.splice(si, 1);
+            if (b.shrapnel) {
+              spawnParticles(ship2.x, ship2.y, 12, '#a7f3d0');
+              for (let sj = G.enemyShips.length - 1; sj >= 0; sj--) {
+                const nearShip = G.enemyShips[sj];
+                if (dist(nearShip.x, nearShip.y, ship2.x, ship2.y) <= SHRAPNEL_KILL_POP_RADIUS) {
+                  G.enemyShips[sj] = damageEnemyShip(nearShip, SHRAPNEL_KILL_POP_DAMAGE);
+                  if (G.enemyShips[sj].hp <= 0) {
+                    spawnParticles(nearShip.x, nearShip.y, 10, '#34d399');
+                    G.score += enemyShipReward(nearShip.type);
+                    if (Math.random() < enemyShipDropChance(nearShip.type)) spawnPowerUp(nearShip.x, nearShip.y);
+                    if (shouldDropOverShield(nearShip.type)) spawnOverShieldPowerUp(nearShip.x, nearShip.y);
+                    G.enemyShips.splice(sj, 1);
+                  }
+                }
+              }
+              for (let aj = G.asteroids.length - 1; aj >= 0; aj--) {
+                const nearAsteroid = G.asteroids[aj];
+                if (dist(nearAsteroid.x, nearAsteroid.y, ship2.x, ship2.y) <= SHRAPNEL_KILL_POP_RADIUS + nearAsteroid.size) {
+                  G.asteroids[aj] = { ...nearAsteroid, hp: nearAsteroid.hp - SHRAPNEL_KILL_POP_DAMAGE };
+                  if (G.asteroids[aj].hp <= 0) {
+                    spawnParticles(nearAsteroid.x, nearAsteroid.y, 10, asteroidColor(nearAsteroid.type));
+                    G.score += Math.floor(nearAsteroid.size * (nearAsteroid.type === 'armored' ? 2 : 1));
+                    G.asteroids.splice(aj, 1);
+                  }
+                }
+              }
+            }
           }
           break;
         }
@@ -779,13 +1223,20 @@ export default function AsteroidShooter() {
     // ── BULLET vs ASTEROIDS ──
     const usedBullets2 = new Set<number>();
     for (let ai = G.asteroids.length - 1; ai >= 0; ai--) {
-      const a = G.asteroids[ai];
       for (let bi = G.bullets.length - 1; bi >= 0; bi--) {
         const b = G.bullets[bi];
         if (usedBullets2.has(b.id)) continue;
+        const a = G.asteroids[ai];
+        if (!a) continue;
+        if ((b.hitAsteroidIds ?? []).includes(a.id)) continue;
         if (dist(b.x, b.y, a.x, a.y) < a.size) {
-          usedBullets2.add(b.id);
-          G.asteroids[ai] = { ...a, hp: a.hp - 2 };
+          G.asteroids[ai] = { ...a, hp: a.hp - b.damage };
+          const hitAsteroidIds = [...(b.hitAsteroidIds ?? []), a.id];
+          if (b.remainingPierce > 0) {
+            G.bullets[bi] = { ...b, remainingPierce: b.remainingPierce - 1, hitAsteroidIds };
+          } else {
+            usedBullets2.add(b.id);
+          }
           if (G.asteroids[ai].hp <= 0) {
             spawnParticles(a.x, a.y, 12, asteroidColor(a.type));
             G.score += Math.floor(a.size * (a.type === 'armored' ? 2 : 1));
@@ -798,8 +1249,35 @@ export default function AsteroidShooter() {
               }
             }
             G.asteroids.splice(ai, 1);
+            if (b.shrapnel) {
+              spawnParticles(a.x, a.y, 10, '#a7f3d0');
+              for (let aj = G.asteroids.length - 1; aj >= 0; aj--) {
+                const nearAsteroid = G.asteroids[aj];
+                if (dist(nearAsteroid.x, nearAsteroid.y, a.x, a.y) <= SHRAPNEL_KILL_POP_RADIUS + nearAsteroid.size) {
+                  G.asteroids[aj] = { ...nearAsteroid, hp: nearAsteroid.hp - SHRAPNEL_KILL_POP_DAMAGE };
+                  if (G.asteroids[aj].hp <= 0) {
+                    spawnParticles(nearAsteroid.x, nearAsteroid.y, 10, asteroidColor(nearAsteroid.type));
+                    G.score += Math.floor(nearAsteroid.size * (nearAsteroid.type === 'armored' ? 2 : 1));
+                    G.asteroids.splice(aj, 1);
+                  }
+                }
+              }
+              for (let sj = G.enemyShips.length - 1; sj >= 0; sj--) {
+                const nearShip = G.enemyShips[sj];
+                if (dist(nearShip.x, nearShip.y, a.x, a.y) <= SHRAPNEL_KILL_POP_RADIUS + 20) {
+                  G.enemyShips[sj] = damageEnemyShip(nearShip, SHRAPNEL_KILL_POP_DAMAGE);
+                  if (G.enemyShips[sj].hp <= 0) {
+                    spawnParticles(nearShip.x, nearShip.y, 10, '#34d399');
+                    G.score += enemyShipReward(nearShip.type);
+                    if (Math.random() < enemyShipDropChance(nearShip.type)) spawnPowerUp(nearShip.x, nearShip.y);
+                    if (shouldDropOverShield(nearShip.type)) spawnOverShieldPowerUp(nearShip.x, nearShip.y);
+                    G.enemyShips.splice(sj, 1);
+                  }
+                }
+              }
+            }
           } else {
-            spawnParticles(a.x, a.y, 3);
+            spawnParticles(a.x, a.y, b.shrapnel ? 4 : 3, b.shrapnel ? '#86efac' : undefined);
           }
           break;
         }
@@ -817,7 +1295,7 @@ export default function AsteroidShooter() {
         if (dist(m.x, m.y, a.x, a.y) < a.size + 5) {
           usedMissiles.add(m.id);
           spawnParticles(m.x, m.y, 10, '#ffaa00');
-          G.asteroids[ai] = { ...a, hp: a.hp - 10 };
+          G.asteroids[ai] = { ...a, hp: a.hp - m.damage };
           if (G.asteroids[ai].hp <= 0) {
             spawnParticles(a.x, a.y, 15, asteroidColor(a.type));
             G.score += Math.floor(a.size * (a.type === 'armored' ? 2 : 1));
@@ -832,18 +1310,47 @@ export default function AsteroidShooter() {
 
     // ── MISSILE vs ENEMY SHIPS ──
     const usedMissilesOnShips = new Set<number>();
+    const processedMissilesOnShips = new Set<number>();
     for (let si = G.enemyShips.length - 1; si >= 0; si--) {
       const enemyShip = G.enemyShips[si];
       for (let mi = G.missiles.length - 1; mi >= 0; mi--) {
         const missile = G.missiles[mi];
         if (usedMissilesOnShips.has(missile.id)) continue;
+        if (processedMissilesOnShips.has(missile.id)) continue;
         if (dist(missile.x, missile.y, enemyShip.x, enemyShip.y) < 26) {
-          usedMissilesOnShips.add(missile.id);
+          processedMissilesOnShips.add(missile.id);
           spawnParticles(missile.x, missile.y, 10, '#ffaa00');
-          G.enemyShips[si] = damageEnemyShip(enemyShip, 10);
+          G.enemyShips[si] = damageEnemyShip(enemyShip, missile.damage);
           if (enemyShip.shield > 0) {
             spawnParticles(enemyShip.x, enemyShip.y, 6, '#66ccff');
+            if (Math.random() < SHIELDED_MISSILE_RICOCHET_CHANCE) {
+              const shipTargets = G.enemyShips
+                .filter(s => s.id !== enemyShip.id)
+                .map(s => ({ id: s.id, type: 'ship' as const }));
+              const asteroidTargets = G.asteroids.map(a => ({ id: a.id, type: 'asteroid' as const }));
+              const ricochetTargets = [...shipTargets, ...asteroidTargets];
+              if (ricochetTargets.length > 0) {
+                G.lastMissileRicochetAt = now;
+                spawnParticles(enemyShip.x, enemyShip.y, 14, '#7dd3fc');
+                const nextTarget = ricochetTargets[Math.floor(Math.random() * ricochetTargets.length)];
+                const bounceAngle = Math.atan2(missile.y - enemyShip.y, missile.x - enemyShip.x);
+                const bounceSpeed = Math.max(2.5, Math.hypot(missile.vx, missile.vy));
+                G.missiles[mi] = {
+                  ...missile,
+                  targetId: nextTarget.id,
+                  targetType: nextTarget.type,
+                  x: enemyShip.x + Math.cos(bounceAngle) * 8,
+                  y: enemyShip.y + Math.sin(bounceAngle) * 8,
+                  vx: Math.cos(bounceAngle) * bounceSpeed,
+                  vy: Math.sin(bounceAngle) * bounceSpeed,
+                  damage: Math.max(1, missile.damage * 0.85),
+                  ricochetCount: missile.ricochetCount + 1,
+                };
+                break;
+              }
+            }
           }
+          usedMissilesOnShips.add(missile.id);
           if (G.enemyShips[si].hp <= 0) {
             spawnParticles(enemyShip.x, enemyShip.y, 15, '#ff6600');
             G.score += enemyShipReward(enemyShip.type);
@@ -913,85 +1420,144 @@ export default function AsteroidShooter() {
     // Trigger re-render
     setTick(t => t + 1);
     rafRef.current = requestAnimationFrame(loop);
-  }, [takeDamage, spawnAsteroid, spawnEnemyShip, scheduleTimeout, playWaveMusicCue]);
+  }, [takeDamage, spawnAsteroid, spawnEnemyShip, scheduleTimeout, playWaveMusicCue, fireSpinUpShot]);
 
   // Input
   useEffect(() => {
     const onMove = (e: MouseEvent) => { G.mouse.x = e.clientX; G.mouse.y = e.clientY; };
+    const stopPress = () => {
+      mousePressed.current = false;
+      mouseDownAt.current = 0;
+      setIsCharging(false);
+    };
     const onDown = (e: MouseEvent) => {
       if (!G.running) return;
+      mousePressed.current = true;
+      if (hasPU('rapidfire') || hasPU('spread')) {
+        mouseDownAt.current = 0;
+        setIsCharging(false);
+        fireSpinUpShot(e.clientX, e.clientY);
+        return;
+      }
       mouseDownAt.current = Date.now();
       setIsCharging(true);
     };
     const onUp = (e: MouseEvent) => {
       if (!G.running) return;
-      if (mouseDownAt.current <= 0) return;
-      const hold = (Date.now() - mouseDownAt.current) / 1000;
+      mousePressed.current = false;
       const hasRapid = hasPU('rapidfire');
       const hasSpread = hasPU('spread');
+      const useSpinUpFiring = hasRapid || hasSpread;
+      if (useSpinUpFiring) {
+        setIsCharging(false);
+        mouseDownAt.current = 0;
+        return;
+      }
+      if (mouseDownAt.current <= 0) return;
+      const hold = (Date.now() - mouseDownAt.current) / 1000;
+      const stunnedOnRelease = Date.now() < G.playerStunUntil;
+      const effectiveHold = stunnedOnRelease ? hold / 1.3 : hold;
       setIsCharging(false);
       mouseDownAt.current = 0;
       if (hold < 0.1) {
         // Quick shot
         const now = Date.now();
         let rate = 250;
-        if (hasRapid) {
-          const rapidfirePowerUp = G.activePowerUps.find(p => p.type === 'rapidfire');
-          if (rapidfirePowerUp) {
-            rate = Math.max(10, 100 - Math.min(1, (now - rapidfirePowerUp.startTime) / 15000) * 90);
-          }
-        } else if (hasSpread) {
-          rate = 150;
+        if (stunnedOnRelease) {
+          rate *= 1.5;
         }
         if (now - G.lastShot < rate) return;
         G.lastShot = now;
         const dx = e.clientX - G.ship.x, dy = e.clientY - G.ship.y;
-        const count = hasSpread ? 3 : 1;
-        for (let i = 0; i < count; i++) {
-          const spreadOffset = hasSpread ? (i - 1) * 0.3 : 0;
-          const ang = Math.atan2(dy, dx) + spreadOffset;
-          G.bullets.push({ id: id(), x: G.ship.x, y: G.ship.y, vx: Math.cos(ang) * 6, vy: Math.sin(ang) * 6 });
-        }
+        const ang = Math.atan2(dy, dx);
+        G.bullets.push({
+          id: id(),
+          x: G.ship.x,
+          y: G.ship.y,
+          vx: Math.cos(ang) * PLAYER_BULLET_SPEED,
+          vy: Math.sin(ang) * PLAYER_BULLET_SPEED,
+          damage: PLAYER_BULLET_DAMAGE,
+          remainingPierce: 0,
+          maxRange: Number.POSITIVE_INFINITY,
+          traveled: 0,
+          shrapnel: false,
+        });
       } else {
-        // Beam
-        let dmg = Math.min(10, 2 + hold * 8);
-        if (hasRapid) {
-          dmg = Math.min(8, 2 + hold * 12);
-        } else if (hasSpread) {
-          dmg = 11 * (1 + Math.min(1, hold / 3) * 3);
-        }
-        const bid = id();
-        G.beams.push({ id: bid, targetX: e.clientX, targetY: e.clientY, damage: dmg, hitAsteroidIds: [], hitShipIds: [] });
-        const count = hasRapid ? 3 : 1;
-        const baseDuration = hasRapid ? 120 : 500;
-        for (let i = 0; i < count; i++) {
-          const delay = hasRapid ? baseDuration + i * 150 : baseDuration;
-          scheduleBeamRemoval(bid, delay);
-        }
+        const chargeRatio = Math.min(1, effectiveHold / CHARGED_RAILCANNON_MAX_CHARGE_SECONDS);
+        const railcannonDamage = Math.round(
+          RAILCANNON_MIN_DAMAGE +
+          (chargeRatio ** 2) * (RAILCANNON_MAX_DAMAGE - RAILCANNON_MIN_DAMAGE)
+        );
+        const railcannonPierce = Math.max(0, Math.round(chargeRatio * RAILCANNON_SHOT_PIERCE));
+        const railcannonRange = RAILCANNON_MIN_RANGE + chargeRatio * (RAILCANNON_SHOT_RANGE - RAILCANNON_MIN_RANGE);
+        const dx = e.clientX - G.ship.x;
+        const dy = e.clientY - G.ship.y;
+        const ang = Math.atan2(dy, dx);
+        G.bullets.push({
+          id: id(),
+          x: G.ship.x,
+          y: G.ship.y,
+          vx: Math.cos(ang) * RAILCANNON_SHOT_SPEED,
+          vy: Math.sin(ang) * RAILCANNON_SHOT_SPEED,
+          damage: railcannonDamage,
+          remainingPierce: railcannonPierce,
+          maxRange: railcannonRange,
+          traveled: 0,
+          shrapnel: false,
+          railcannon: true,
+        });
       }
     };
     const onKeyDown = (e: KeyboardEvent) => {
       keys.current.add(e.key.toLowerCase());
+      if (e.key.toLowerCase() === 'c' && !e.repeat) {
+        setMenuVisible((prev) => !prev);
+      }
       if (e.key.toLowerCase() === 'e') {
+        if (Date.now() < G.playerStunUntil) return;
         const now = Date.now();
-        if (now > G.timeSlowCooldown) {
+        if (noTimeSlowCooldownCheat || now > G.timeSlowCooldown) {
           G.timeSlow = true;
-          G.timeSlowCooldown = now + 10000;
+          if (!noTimeSlowCooldownCheat) {
+            G.timeSlowCooldown = now + 10000;
+          }
           scheduleTimeout(() => { G.timeSlow = false; }, 3500);
         }
       }
       if (e.key.toLowerCase() === 'q') {
+        if (Date.now() < G.playerStunUntil) return;
         const now = Date.now();
-        if (now > G.missileCooldown) {
-          G.missileCooldown = now + 5000;
-          const shipTargets = [...G.enemyShips].sort(() => Math.random() - 0.5).slice(0, 2);
-          const asteroidTargets = [...G.asteroids].sort(() => Math.random() - 0.5).slice(0, 3);
-          const targets: Array<{ id: number; type: Missile['targetType'] }> = [];
-          shipTargets.forEach(t => targets.push({ id: t.id, type: 'ship' }));
-          asteroidTargets.forEach(t => targets.push({ id: t.id, type: 'asteroid' }));
-          targets.sort(() => Math.random() - 0.5);
-          for (let i = 0; i < targets.length; i++) {
-            scheduleMissileLaunchToTarget(targets[i].id, targets[i].type, i * 100);
+        if (noMissileCooldownCheat || now > G.missileCooldown) {
+          if (!noMissileCooldownCheat) {
+            G.missileCooldown = now + 5000;
+          }
+          const allTargets: Array<{ id: number; type: Missile['targetType'] }> = [
+            ...G.enemyShips.map(t => ({ id: t.id, type: 'ship' as const })),
+            ...G.asteroids.map(t => ({ id: t.id, type: 'asteroid' as const })),
+          ];
+          if (allTargets.length > 0) {
+            const shuffled = [...allTargets].sort(() => Math.random() - 0.5);
+            const launchTargets: Array<{ id: number; type: Missile['targetType'] }> = [];
+            if (shuffled.length === 1) {
+              for (let i = 0; i < PLAYER_MISSILE_COUNT; i++) {
+                launchTargets.push(shuffled[0]);
+              }
+            } else {
+              const distinctCount = Math.min(PLAYER_MISSILE_COUNT, shuffled.length);
+              for (let i = 0; i < distinctCount; i++) {
+                launchTargets.push(shuffled[i]);
+              }
+              while (launchTargets.length < PLAYER_MISSILE_COUNT) {
+                launchTargets.push(shuffled[launchTargets.length % distinctCount]);
+              }
+            }
+            const isSingleTargetFocus = shuffled.length === 1;
+            const missileDamage = isSingleTargetFocus
+              ? PLAYER_MISSILE_SINGLE_TARGET_DAMAGE
+              : PLAYER_MISSILE_BASE_DAMAGE;
+            for (let i = 0; i < launchTargets.length; i++) {
+              scheduleMissileLaunchToTarget(launchTargets[i].id, launchTargets[i].type, i * 100, missileDamage);
+            }
           }
         }
       }
@@ -1000,16 +1566,21 @@ export default function AsteroidShooter() {
     globalThis.addEventListener('mousemove', onMove);
     globalThis.addEventListener('mousedown', onDown);
     globalThis.addEventListener('mouseup', onUp);
+    globalThis.addEventListener('mouseleave', stopPress);
+    globalThis.addEventListener('blur', stopPress);
     globalThis.addEventListener('keydown', onKeyDown);
     globalThis.addEventListener('keyup', onKeyUp);
     return () => {
       globalThis.removeEventListener('mousemove', onMove);
       globalThis.removeEventListener('mousedown', onDown);
       globalThis.removeEventListener('mouseup', onUp);
+      globalThis.removeEventListener('mouseleave', stopPress);
+      globalThis.removeEventListener('blur', stopPress);
       globalThis.removeEventListener('keydown', onKeyDown);
       globalThis.removeEventListener('keyup', onKeyUp);
+      mousePressed.current = false;
     };
-  }, [scheduleTimeout, scheduleBeamRemoval, scheduleMissileLaunch, scheduleMissileLaunchToTarget]);
+  }, [scheduleTimeout, scheduleMissileLaunch, scheduleMissileLaunchToTarget, noTimeSlowCooldownCheat, noMissileCooldownCheat, fireSpinUpShot]);
 
   // Spawners
   useEffect(() => {
@@ -1039,8 +1610,18 @@ export default function AsteroidShooter() {
 
       const startTimeout = globalThis.setTimeout(() => {
         if (cancelled || !G.running) return;
-        if (G.enemyShips.some(enemyShip => enemyShip.type === 'tank')) {
+        if (G.disableEnemySpawns) {
           scheduleNextWave(1000, false);
+          return;
+        }
+        if (G.enemyShips.some(enemyShip => enemyShip.type === 'tank')) {
+          G.waveDelayBlockedByTank = true;
+          scheduleNextWave(1000, false);
+          return;
+        }
+        if (G.waveDelayBlockedByTank) {
+          G.waveDelayBlockedByTank = false;
+          scheduleNextWave(WAVE_INTERVAL_MS);
           return;
         }
         G.wave += 1;
@@ -1082,25 +1663,33 @@ export default function AsteroidShooter() {
   const startGame = () => {
     clearAllTimeouts();
     // Reset G
-    G.asteroids = []; G.bullets = []; G.enemyBullets = []; G.enemyShips = [];
+    G.asteroids = []; G.bullets = []; G.enemyBullets = []; G.enemyShips = []; G.enemyMissiles = [];
     G.enemyBeams = [];
     G.particles = []; G.powerUps = []; G.activePowerUps = []; G.beams = []; G.missiles = [];
     G.ship = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
     G.vel = { x: 0, y: 0 };
-    G.hp = 100; G.playerShield = G.playerBaseShieldMax; G.deathsDefied = 1; G.score = 0;
+    G.hp = 100; G.playerStunUntil = 0; G.playerShield = G.playerBaseShieldMax; G.deathsDefied = 1; G.score = 0;
     G.invincible = false; G.deathDefied = false; G.timeSlow = false;
+    G.disableEnemySpawns = enemySpawnCheatOff;
+    G.deathDefiedSlowUntil = 0;
     G.timeSlowCooldown = 0; G.missileCooldown = 0;
+    G.rapidSpinUp = 0; G.spreadSpinUp = 0;
+    G.lastFrameAt = 0;
     G.lastShot = 0; G.lastHit = 0;
     G.lastPlayerDamageAt = Date.now();
     G.lastShieldRegenAt = G.lastPlayerDamageAt;
     G.wave = 0;
     G.waveSpawnEndsAt = 0;
     G.waveEndCuePlayed = true;
+    G.waveDelayBlockedByTank = false;
     G.firstCaptainOverShieldDropped = false;
+    G.lastMissileRicochetAt = 0;
     G.running = true;
     gameOverRef.current = false;
     keys.current.clear();
     mouseDownAt.current = 0;
+    mousePressed.current = false;
+    setMenuVisible(false);
     setGameOver(false);
     setGameStarted(true);
     setIsCharging(false);
@@ -1110,9 +1699,12 @@ export default function AsteroidShooter() {
     cancelAnimationFrame(rafRef.current);
     clearAllTimeouts();
     G.running = false;
+    G.lastFrameAt = 0;
     setGameStarted(false);
     setGameOver(false);
+    setMenuVisible(false);
     setIsCharging(false);
+    mousePressed.current = false;
   };
 
   if (!mounted) return null;
@@ -1124,19 +1716,25 @@ export default function AsteroidShooter() {
   const hpDisplayColor = hpColor(G.hp, 100);
   const gameOverMessage = scoreMessage(G.score);
   const nowTs = Date.now();
+  const timeSlowReady = noTimeSlowCooldownCheat || nowTs >= G.timeSlowCooldown;
+  const missilesReady = noMissileCooldownCheat || nowTs >= G.missileCooldown;
+  const playerStunned = nowTs < G.playerStunUntil;
+  const recentMissileRicochet = nowTs - G.lastMissileRicochetAt < 900;
   const rapidActive = hasPU('rapidfire');
   const spreadActive = hasPU('spread');
   const deathDefiedAvailable = G.deathsDefied > 0;
   const deathDefiedDotColor = deathDefiedAvailable ? '#FFD700' : '#333';
   const deathDefiedDotShadow = deathDefiedAvailable ? '0 0 10px #FFD700,0 0 20px #FFA500' : 'none';
   const deathDefiedDotBorder = deathDefiedAvailable ? '#FFD700' : '#555';
+  const deathDefiedSlowActive = nowTs < G.deathDefiedSlowUntil;
   const shipOpacity = G.invincible ? 0.5 : 1;
   const shipAnimation = G.invincible ? 'flash .2s infinite' : 'none';
   const hasOverShield = G.playerShield > G.playerBaseShieldMax;
   const shieldAuraColor = hasOverShield ? '#00ff66' : '#00ccff';
   const shieldFillColor = shieldAuraColor;
+  const beamModeActive = !rapidActive && !spreadActive;
   let chargeColor = 'cyan';
-  let chargeDurationMs = 1000;
+  let chargeDurationMs = CHARGED_RAILCANNON_MAX_CHARGE_SECONDS * 1000;
   if (rapidActive) {
     chargeColor = '#ff0';
     chargeDurationMs = 500;
@@ -1151,27 +1749,15 @@ export default function AsteroidShooter() {
         @keyframes pulse { 0%,100%{opacity:1}50%{opacity:0.5} }
         @keyframes flash { 0%,100%{opacity:0.3}50%{opacity:1} }
         @keyframes sniperFlash { 0%,100%{opacity:.2}50%{opacity:1} }
-        @keyframes ddPulse { 0%{opacity:0.5}100%{opacity:1} }
-        @keyframes ddText { 0%{opacity:0;transform:translate(-50%,-50%) scale(0.6)} 15%{opacity:1;transform:translate(-50%,-50%) scale(1.15)} 30%{transform:translate(-50%,-50%) scale(1)} 70%{opacity:1} 100%{opacity:0;transform:translate(-50%,-60%)} }
+        @keyframes shieldTextPulse { 0%,100%{opacity:0.85}50%{opacity:1} }
       `}</style>
 
       <div className="absolute inset-0 z-0">
         <PixelSnow color="#ffffff" flakeSize={0.01} minFlakeSize={1.25} pixelResolution={200} speed={1.25} depthFade={8} farPlane={20} brightness={0.7} gamma={0.4545} density={0.3} variant="snowflake" direction={125} />
       </div>
 
-      {/* Death Defied effect */}
-      {G.deathDefied && (
-        <>
-          <div className="absolute inset-0 z-50 pointer-events-none" style={{ background: 'radial-gradient(ellipse at center,rgba(255,215,0,.45) 0%,rgba(255,165,0,.2) 40%,transparent 70%)', animation: 'ddPulse .6s ease-out infinite alternate' }} />
-          <div className="absolute inset-0 z-50 pointer-events-none" style={{ boxShadow: 'inset 0 0 120px 40px rgba(255,200,0,.35)' }} />
-          <div className="absolute top-1/2 left-1/2 z-50 pointer-events-none" style={{ animation: 'ddText 3s ease-out forwards' }}>
-            <div style={{ fontFamily: 'monospace', fontSize: 52, fontWeight: 'bold', color: '#FFD700', textShadow: '0 0 30px #FFD700,0 0 60px #FFA500,0 0 100px #FF8C00', letterSpacing: 6, whiteSpace: 'nowrap' }}>DEATH DEFIED</div>
-          </div>
-        </>
-      )}
-
       {/* Time slow effect */}
-      {G.timeSlow && (
+      {(G.timeSlow || deathDefiedSlowActive) && (
         <>
           <div className="absolute inset-0 z-40 pointer-events-none" style={{ mixBlendMode: 'saturation', backgroundColor: 'rgba(128,128,128,.8)', animation: 'flash .5s ease-in-out' }} />
           <svg className="absolute inset-0 z-40 w-full h-full pointer-events-none" style={{ opacity: .3 }}>
@@ -1205,29 +1791,92 @@ export default function AsteroidShooter() {
                 <div style={{ width: `${(G.playerShield / (G.playerBaseShieldMax + G.playerOverShieldMax)) * 100}%`, height: '100%', borderRadius: 4, backgroundColor: shieldFillColor, transition: 'width .2s,background-color .3s', boxShadow: `0 0 6px ${shieldFillColor}` }} />
               </div>
             </div>
+            {recentMissileRicochet && <div className="mt-2 text-xs" style={{ color: '#7dd3fc', textShadow: '0 0 8px #7dd3fc' }}>MISSILE RICOCHET!</div>}
           </div>
 
-          <div className="absolute top-5 right-5 z-10 font-mono text-sm text-white" style={{ textShadow: '2px 2px 4px rgba(0,0,0,.8)' }}>
+          {menuVisible && (
+          <div className="absolute top-5 right-5 z-20 font-mono text-xs text-white pointer-events-auto" style={{ width: 270, background: 'rgba(10,10,20,.78)', border: '1px solid #335', borderRadius: 8, padding: 10, boxShadow: '0 0 12px rgba(50,120,220,.25)', textShadow: '2px 2px 4px rgba(0,0,0,.8)' }}>
+            <div style={{ color: '#7dd3fc', fontWeight: 'bold', marginBottom: 8 }}>MENU</div>
+
             {G.activePowerUps.filter(p => p.type !== 'shield' && p.type !== 'overshield').map((p) => (
-              <div key={`${p.type}-${p.endTime}`} style={{ color: puColor(p.type), marginBottom: 5 }}>{p.type.toUpperCase()}: {Math.ceil((p.endTime - nowTs) / 1000)}s</div>
+              <div key={`${p.type}-${p.endTime}`} style={{ color: puColor(p.type), marginBottom: 5 }}>
+                {p.type.toUpperCase()}: {Math.ceil((p.endTime - nowTs) / 1000)}s
+              </div>
             ))}
-          </div>
 
-          <div className="absolute z-10 font-mono text-sm text-white" style={{ top: 130, right: 20, textShadow: '2px 2px 4px rgba(0,0,0,.8)' }}>
-            <div className="mb-2 flex gap-2 items-center">
-              <span style={{ color: '#0ff' }}>E - Time Slow:</span>
-              {nowTs < G.timeSlowCooldown ? <span style={{ color: '#f66' }}>{Math.ceil((G.timeSlowCooldown - nowTs) / 1000)}s</span> : <span style={{ color: '#0f0' }}>READY</span>}
+            <div style={{ marginTop: 6, marginBottom: 8, borderTop: '1px solid #334155', paddingTop: 8 }}>
+              <div className="mb-2 flex gap-2 items-center text-sm">
+                <span style={{ color: '#0ff' }}>E - Time Slow:</span>
+                {playerStunned ? <span style={{ color: '#d8b4fe' }}>LOCKED (STUN)</span> : (timeSlowReady ? <span style={{ color: '#0f0' }}>READY</span> : <span style={{ color: '#f66' }}>{Math.ceil((G.timeSlowCooldown - nowTs) / 1000)}s</span>)}
+              </div>
+              <div className="flex gap-2 items-center text-sm">
+                <span style={{ color: '#f80' }}>Q - Missiles:</span>
+                {playerStunned ? <span style={{ color: '#d8b4fe' }}>LOCKED (STUN)</span> : (missilesReady ? <span style={{ color: '#0f0' }}>READY</span> : <span style={{ color: '#f66' }}>{Math.ceil((G.missileCooldown - nowTs) / 1000)}s</span>)}
+              </div>
             </div>
-            <div className="flex gap-2 items-center">
-              <span style={{ color: '#f80' }}>Q - Missiles:</span>
-              {nowTs < G.missileCooldown ? <span style={{ color: '#f66' }}>{Math.ceil((G.missileCooldown - nowTs) / 1000)}s</span> : <span style={{ color: '#0f0' }}>READY</span>}
+
+            <div style={{ borderTop: '1px solid #334155', paddingTop: 8 }}>
+              <div style={{ color: '#7dd3fc', fontWeight: 'bold', marginBottom: 6 }}>CHEATS</div>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={enemySpawnCheatOff}
+                  onChange={(e) => setDisableEnemySpawnCheat(e.target.checked)}
+                  style={{ accentColor: '#38bdf8' }}
+                />
+                <span style={{ color: enemySpawnCheatOff ? '#fca5a5' : '#9ca3af' }}>Disable enemy auto spawns</span>
+              </label>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={noTimeSlowCooldownCheat}
+                  onChange={(e) => setNoTimeSlowCooldownCheat(e.target.checked)}
+                  style={{ accentColor: '#38bdf8' }}
+                />
+                <span style={{ color: noTimeSlowCooldownCheat ? '#86efac' : '#9ca3af' }}>No cooldown: Time Slow</span>
+              </label>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={noMissileCooldownCheat}
+                  onChange={(e) => setNoMissileCooldownCheat(e.target.checked)}
+                  style={{ accentColor: '#38bdf8' }}
+                />
+                <span style={{ color: noMissileCooldownCheat ? '#86efac' : '#9ca3af' }}>No cooldown: Missiles</span>
+              </label>
+
+              <div style={{ color: '#94a3b8', marginBottom: 6 }}>Grant pickups / charges</div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2,minmax(0,1fr))', gap: 6, marginBottom: 8 }}>
+                <button type="button" onClick={grantDeathDefiedCheat} style={{ cursor: 'pointer', fontSize: 10, padding: '5px 6px', borderRadius: 6, border: '1px solid #355', background: 'rgba(26,36,52,.9)', color: '#fef08a' }}>+ Death Defied</button>
+                <button type="button" onClick={() => grantPickableCheat('health')} style={{ cursor: 'pointer', fontSize: 10, padding: '5px 6px', borderRadius: 6, border: '1px solid #355', background: 'rgba(26,36,52,.9)', color: '#86efac' }}>+ Health</button>
+                <button type="button" onClick={() => grantPickableCheat('shield')} style={{ cursor: 'pointer', fontSize: 10, padding: '5px 6px', borderRadius: 6, border: '1px solid #355', background: 'rgba(26,36,52,.9)', color: '#67e8f9' }}>+ Shield</button>
+                <button type="button" onClick={() => grantPickableCheat('overshield')} style={{ cursor: 'pointer', fontSize: 10, padding: '5px 6px', borderRadius: 6, border: '1px solid #355', background: 'rgba(26,36,52,.9)', color: '#4ade80' }}>+ Overshield</button>
+                <button type="button" onClick={() => grantPickableCheat('rapidfire')} style={{ cursor: 'pointer', fontSize: 10, padding: '5px 6px', borderRadius: 6, border: '1px solid #355', background: 'rgba(26,36,52,.9)', color: '#fde047' }}>+ Rapidfire</button>
+                <button type="button" onClick={() => grantPickableCheat('spread')} style={{ cursor: 'pointer', fontSize: 10, padding: '5px 6px', borderRadius: 6, border: '1px solid #355', background: 'rgba(26,36,52,.9)', color: '#f0abfc' }}>+ Spread</button>
+              </div>
+
+              <div style={{ color: '#94a3b8', marginBottom: 6 }}>Direct enemy spawn</div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,minmax(0,1fr))', gap: 6 }}>
+                {(['fighter', 'sniper', 'captain', 'aggressive', 'grenadier', 'tank'] as EnemyShip['type'][]).map((enemyType) => (
+                  <button
+                    key={enemyType}
+                    type="button"
+                    onClick={() => manualSpawnEnemy(enemyType)}
+                    style={{ cursor: 'pointer', fontSize: 10, padding: '5px 6px', borderRadius: 6, border: '1px solid #355', background: 'rgba(26,36,52,.9)', color: '#e5e7eb' }}
+                  >
+                    {enemyType.toUpperCase()}
+                  </button>
+                ))}
+              </div>
             </div>
           </div>
+          )}
 
           <div className="absolute bottom-5 left-5 z-10 font-mono text-sm text-white opacity-70">
             <div>WASD / Arrows: Move</div>
-            <div style={{ color: '#ff0' }}>Click: Shoot &nbsp; <span style={{ color: '#0ff' }}>Hold: Beam</span></div>
+            <div style={{ color: '#ff0' }}>Click: Shoot &nbsp; <span style={{ color: '#0ff' }}>Hold: Charge Railcannon</span></div>
             <div className="mt-1" style={{ color: '#f44' }}>Watch out for enemy ships!</div>
+            <div className="mt-1" style={{ color: '#7dd3fc' }}>Press C: Toggle Menu</div>
           </div>
         </>
       )}
@@ -1238,7 +1887,7 @@ export default function AsteroidShooter() {
           <h1 className="text-6xl mb-5" style={{ textShadow: '0 0 20px cyan,0 0 40px cyan', letterSpacing: 5 }}>ASTEROID DEFENDER</h1>
           <div className="text-lg mb-10 text-gray-400 leading-loose">
             <p>WASD / Arrows to move &nbsp;|&nbsp; Mouse to aim</p>
-            <p><span style={{ color: '#ff0' }}>Click: shoot</span> &nbsp;|&nbsp; <span style={{ color: '#0ff' }}>Hold: beam</span></p>
+            <p><span style={{ color: '#ff0' }}>Click: shoot</span> &nbsp;|&nbsp; <span style={{ color: '#0ff' }}>Hold: charge railcannon</span></p>
             <p className="mt-3" style={{ color: '#f44' }}>Enemy ships hunt and shoot you!</p>
             <p className="mt-1" style={{ color: '#FFD700', fontSize: 14 }}>1× Death Defied — survive your first death!</p>
           </div>
@@ -1269,7 +1918,18 @@ export default function AsteroidShooter() {
         <div className="absolute inset-0 z-[1] pointer-events-none">
           {/* Ship */}
           <div className="absolute" style={{ left: ship.x, top: ship.y, transform: `translate(-50%,-50%) rotate(${Math.atan2(mouse.y - ship.y, mouse.x - ship.x)}rad)`, opacity: shipOpacity, animation: shipAnimation }}>
+            {nowTs < G.playerStunUntil && (
+              <div style={{ position: 'absolute', left: '50%', top: -30, transform: 'translateX(-50%)', color: '#d8b4fe', fontSize: 10, fontFamily: 'monospace', fontWeight: 'bold', letterSpacing: 1, textShadow: '0 0 8px #d8b4fe,0 0 14px #a78bfa', whiteSpace: 'nowrap' }}>
+                STUNNED
+              </div>
+            )}
+            {G.deathDefied && (
+              <div style={{ position: 'absolute', left: '50%', top: -16, transform: 'translateX(-50%)', color: '#FFD700', fontSize: 10, fontFamily: 'monospace', fontWeight: 'bold', letterSpacing: 1, textShadow: '0 0 8px #FFD700, 0 0 14px #FFB300', whiteSpace: 'nowrap', animation: 'shieldTextPulse .8s ease-in-out infinite' }}>
+                SHIELD
+              </div>
+            )}
             <svg width="40" height="40" viewBox="0 0 40 40">
+              {G.deathDefied && <circle cx="20" cy="20" r="18" fill="none" stroke="#FFD700" strokeWidth="3" opacity="0.95" style={{ filter: 'drop-shadow(0 0 8px #FFD700)' }} />}
               {G.playerShield > 0 && <circle cx="20" cy="20" r="17" fill="none" stroke={shieldAuraColor} strokeWidth="2" opacity="0.75" />}
               <polygon points="30,20 10,10 10,30" fill="white" stroke={G.invincible ? '#f44' : 'cyan'} strokeWidth="2" />
             </svg>
@@ -1334,8 +1994,27 @@ export default function AsteroidShooter() {
           <svg className="absolute inset-0 w-full h-full pointer-events-none">
             {G.enemyBeams.map(beam => (
               <g key={beam.id}>
-                <line x1={beam.x1} y1={beam.y1} x2={beam.x2} y2={beam.y2} stroke={beam.type === 'telegraph' ? '#ff66ff' : '#ff1177'} strokeWidth={beam.type === 'telegraph' ? 3 : 6} opacity={beam.type === 'telegraph' ? '.45' : '.35'} strokeDasharray={beam.type === 'telegraph' ? '8,6' : undefined} strokeLinecap="round" />
-                <line x1={beam.x1} y1={beam.y1} x2={beam.x2} y2={beam.y2} stroke={beam.type === 'telegraph' ? '#ffe6ff' : '#ffd1f0'} strokeWidth={beam.type === 'telegraph' ? 1.5 : 2} opacity={beam.type === 'telegraph' ? '.65' : '.85'} strokeLinecap="round" />
+                <line
+                  x1={beam.x1}
+                  y1={beam.y1}
+                  x2={beam.x2}
+                  y2={beam.y2}
+                  stroke={beam.type === 'telegraph' ? '#ff66ff' : beam.type === 'tankGrenade' ? '#f5d76e' : beam.type === 'tankSnap' ? '#a78bfa' : beam.type === 'tankSnapStrike' ? '#f0abfc' : '#ff1177'}
+                  strokeWidth={beam.type === 'telegraph' ? 3 : beam.type === 'tankSnap' ? 3 : beam.type === 'tankSnapStrike' ? 8 : beam.type === 'tankGrenade' ? 5 : 6}
+                  opacity={beam.type === 'telegraph' ? '.45' : beam.type === 'tankSnap' ? '.35' : beam.type === 'tankSnapStrike' ? '.68' : beam.type === 'tankGrenade' ? '.35' : '.35'}
+                  strokeDasharray={beam.type === 'telegraph' ? '8,6' : beam.type === 'tankSnap' ? '7,7' : beam.type === 'tankGrenade' ? '2,6' : undefined}
+                  strokeLinecap="round"
+                />
+                <line
+                  x1={beam.x1}
+                  y1={beam.y1}
+                  x2={beam.x2}
+                  y2={beam.y2}
+                  stroke={beam.type === 'telegraph' ? '#ffe6ff' : beam.type === 'tankGrenade' ? '#fff2b0' : beam.type === 'tankSnap' ? '#ddd6fe' : beam.type === 'tankSnapStrike' ? '#fdf4ff' : '#ffd1f0'}
+                  strokeWidth={beam.type === 'telegraph' ? 1.5 : beam.type === 'tankSnap' ? 1.5 : beam.type === 'tankSnapStrike' ? 2.8 : beam.type === 'tankGrenade' ? 2 : 2}
+                  opacity={beam.type === 'telegraph' ? '.65' : beam.type === 'tankSnap' ? '.7' : beam.type === 'tankSnapStrike' ? '.95' : beam.type === 'tankGrenade' ? '.8' : '.85'}
+                  strokeLinecap="round"
+                />
               </g>
             ))}
           </svg>
@@ -1347,17 +2026,24 @@ export default function AsteroidShooter() {
 
           {/* Enemy missiles */}
           {G.enemyMissiles.map(m => (
-            <div key={m.id} className="absolute w-3 h-4 rounded" style={{ left: m.x, top: m.y, transform: 'translate(-50%,-50%)', background: 'linear-gradient(to bottom, #88cc44, #ddff88)', boxShadow: '0 0 8px rgba(136,204,68,.9)' }} />
+            <div key={m.id} className="absolute w-3 h-4 rounded" style={{ left: m.x, top: m.y, transform: 'translate(-50%,-50%)', background: m.type === 'tankGrenade' ? 'linear-gradient(to bottom, #f5d76e, #d4a838)' : m.type === 'tankSnap' ? 'linear-gradient(to bottom, #c4b5fd, #8b5cf6)' : 'linear-gradient(to bottom, #88cc44, #ddff88)', boxShadow: m.type === 'tankGrenade' ? '0 0 10px rgba(245,215,110,.95)' : m.type === 'tankSnap' ? '0 0 10px rgba(168,139,250,.95)' : '0 0 8px rgba(136,204,68,.9)' }}>
+              {m.type === 'tankGrenade' && (
+                <div style={{ position: 'absolute', left: '50%', top: -14, transform: 'translateX(-50%)', width: 16, height: 2, background: 'rgba(40,30,10,.7)', borderRadius: 2 }}>
+                  <div style={{ width: `${Math.max(0, Math.min(100, (((m.explodesAt ?? nowTs) - nowTs) / TANK_GRENADE_LIFE_MS) * 100))}%`, height: '100%', background: '#f5d76e', borderRadius: 2 }} />
+                </div>
+              )}
+            </div>
           ))}
 
           {/* Asteroids */}
           {G.asteroids.map(a => {
             const col = asteroidStrokeColor(a.type);
             const asteroidHpColor = hpColor(a.hp, a.maxHp);
+            const asteroidStunned = nowTs < (a.stunnedUntil ?? 0);
             return (
               <div key={a.id} className="asteroid-target absolute pointer-events-auto" style={{ left: a.x, top: a.y, width: a.size * 2, height: a.size * 2, transform: `translate(-50%,-50%) rotate(${a.rotation}deg)` }}>
                 <svg width={a.size * 2} height={a.size * 2} viewBox="0 0 100 100">
-                  <polygon points="50,5 80,25 85,60 60,90 30,85 10,60 15,25" fill="rgba(100,100,100,.8)" stroke={col} strokeWidth={a.type === 'armored' ? 4 : 2} />
+                  <polygon points="50,5 80,25 85,60 60,90 30,85 10,60 15,25" fill={asteroidStunned ? 'rgba(150,130,190,.85)' : 'rgba(100,100,100,.8)'} stroke={asteroidStunned ? '#c4b5fd' : col} strokeWidth={a.type === 'armored' ? 4 : 2} />
                 </svg>
                 <div className="absolute -bottom-2 left-1/2 h-1 rounded overflow-hidden" style={{ width: a.size * 1.5, transform: `translateX(-50%) rotate(${-a.rotation}deg)`, background: 'rgba(150,0,0,.3)', border: '1px solid rgba(255,255,255,.5)' }}>
                   <div style={{ width: `${a.hp / a.maxHp * 100}%`, height: '100%', backgroundColor: asteroidHpColor }} />
@@ -1375,12 +2061,33 @@ export default function AsteroidShooter() {
 
           {/* Bullets */}
           {G.bullets.map(b => (
-            <div key={b.id} className="absolute w-1.5 h-1.5 rounded-full bg-yellow-400" style={{ left: b.x, top: b.y, transform: 'translate(-50%,-50%)', boxShadow: '0 0 10px yellow' }} />
+            <div
+              key={b.id}
+              className={`absolute ${b.railcannon ? '' : 'w-1.5 h-1.5 rounded-full'}`}
+              style={b.railcannon
+                ? {
+                    left: b.x,
+                    top: b.y,
+                    width: 22,
+                    height: 4,
+                    borderRadius: 999,
+                    background: 'linear-gradient(to right, rgba(255,255,255,.4), #67e8f9, #ffffff)',
+                    transform: `translate(-50%,-50%) rotate(${Math.atan2(b.vy, b.vx)}rad)`,
+                    boxShadow: '0 0 16px #67e8f9, 0 0 28px rgba(103,232,249,.9)',
+                  }
+                : {
+                    left: b.x,
+                    top: b.y,
+                    transform: 'translate(-50%,-50%)',
+                    backgroundColor: b.shrapnel ? '#34d399' : '#facc15',
+                    boxShadow: b.shrapnel ? '0 0 9px #34d399' : '0 0 10px yellow',
+                  }}
+            />
           ))}
 
           {/* Missiles */}
           {G.missiles.map(m => (
-            <div key={m.id} className="absolute w-2 h-3 rounded-full bg-gradient-to-b from-orange-500 to-red-600" style={{ left: m.x, top: m.y, transform: 'translate(-50%,-50%)', boxShadow: '0 0 8px rgba(255,100,0,.8)' }} />
+            <div key={m.id} className="absolute w-2 h-3 rounded-full" style={{ left: m.x, top: m.y, transform: 'translate(-50%,-50%)', background: m.ricochetCount > 0 ? 'linear-gradient(to bottom, #7dd3fc, #38bdf8)' : 'linear-gradient(to bottom, #f97316, #dc2626)', boxShadow: m.ricochetCount > 0 ? '0 0 10px rgba(125,211,252,.95)' : '0 0 8px rgba(255,100,0,.8)' }} />
           ))}
 
           {/* Particles */}
@@ -1392,7 +2099,7 @@ export default function AsteroidShooter() {
           })}
 
           {/* Beams */}
-          {(G.beams.length > 0 || isCharging) && (
+          {(G.beams.length > 0 || (beamModeActive && isCharging)) && (
             <svg className="absolute inset-0 w-full h-full pointer-events-none">
               <defs><filter id="glow"><feGaussianBlur stdDeviation="3" result="cb"/><feMerge><feMergeNode in="cb"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>
               {G.beams.map(beam => {
@@ -1412,7 +2119,7 @@ export default function AsteroidShooter() {
                   </g>
                 );
               })}
-              {isCharging && (
+              {beamModeActive && isCharging && (
                 <line x1={ship.x} y1={ship.y} x2={mouse.x} y2={mouse.y} stroke={chargeColor} strokeWidth="2" opacity=".5" strokeDasharray="5,5">
                   <animate attributeName="stroke-dashoffset" values="0;10" dur=".3s" repeatCount="indefinite" />
                 </line>
@@ -1421,10 +2128,10 @@ export default function AsteroidShooter() {
           )}
 
           {/* Charge bar */}
-          {isCharging && (
+          {beamModeActive && isCharging && (
             <div className="absolute pointer-events-none" style={{ left: ship.x, top: ship.y - 42, transform: 'translateX(-50%)' }}>
               <div style={{ width: 60, height: 6, background: '#333', borderRadius: 3, border: `1px solid ${chargeColor}` }}>
-                <div style={{ width: `${Math.min(100, ((Date.now() - mouseDownAt.current) / chargeDurationMs) * 100)}%`, height:'100%', borderRadius:3, backgroundColor: chargeColor }} />
+                <div style={{ width: `${Math.min(100, ((Date.now() - mouseDownAt.current) / (playerStunned ? chargeDurationMs * 1.3 : chargeDurationMs)) * 100)}%`, height:'100%', borderRadius:3, backgroundColor: chargeColor }} />
               </div>
             </div>
           )}
